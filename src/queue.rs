@@ -1,11 +1,7 @@
 use std::{
-    cell::Cell,
-    marker::PhantomData,
-    sync::{
-        Arc,
-        atomic::{AtomicIsize, AtomicU32},
-    },
-    thread::{JoinHandle, available_parallelism},
+    cell::Cell, marker::PhantomData, ops::Deref, sync::{
+        Arc, atomic::{AtomicIsize, AtomicU32, Ordering, fence},
+    }, thread::{JoinHandle, available_parallelism},
 };
 
 // Job types:
@@ -18,6 +14,12 @@ use std::{
 
 #[repr(align(64))]
 struct CacheAligned<T>(T);
+impl<T> Deref for CacheAligned<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 /// The maximum number of tasks that can be enqueued in a [WorkQueue]
 const MAX_TASKS_PER_WORKER: usize = 4096;
@@ -30,20 +32,73 @@ pub(crate) struct WorkItem(u32);
 // its arguments.
 // The owner pushes and pops at the bottom (LIFO). Stealers take from the top (FIFO).
 // TODO: Add resizing by the owner of the queue
-pub(crate) struct WorkQueue {
+struct WorkQueue {
     top: CacheAligned<AtomicIsize>,
     bottom: CacheAligned<AtomicIsize>,
     slots: Box<[AtomicU32]>,
 }
 impl WorkQueue {
-    pub(crate) fn new() -> Self {
-        todo!()
+    fn new() -> Self {
+        let top = CacheAligned(AtomicIsize::from(0));
+        let bottom = CacheAligned(AtomicIsize::from(0));
+        let slots: Box<_> = (0..MAX_TASKS_PER_WORKER)
+            .map(|_| AtomicU32::from(0))
+            .collect();
+        Self { top, bottom, slots }
     }
 
     // Split into a channel for pushing and popping tasks and a stealer that can be used by non-owners to steal
     // tasks from this queue
-    pub(crate) fn split(self) -> (WorkChannel, StealReceiver) {
-        todo!()
+    fn split(self) -> (WorkChannel, StealReceiver) {
+        let inner = Arc::new(self);
+        (WorkChannel::new(inner.clone()), StealReceiver::new(inner))
+    }
+
+    fn mask(index: usize) -> usize{
+        index & (MAX_TASKS_PER_WORKER - 1)
+    }
+
+    fn pop_from_bottom(&self) -> Option<WorkItem> {
+        let b = self.bottom.load(Ordering::Relaxed) - 1;
+        self.bottom.store(b, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        let t = self.top.load(Ordering::Relaxed);
+
+        // Check if queue is empty
+        if t > b {
+            self.bottom.store(b + 1, Ordering::Relaxed);
+            return None;
+        }
+
+        let index = Self::mask(b as usize);
+        let slot = &self.slots[index];
+        let item = WorkItem(slot.load(Ordering::Relaxed));
+
+        if t < b {
+            Some(item)
+        } else {
+            debug_assert!(t == b); // sanity
+            // this is the last item so we are racing with thieves
+            let won = self.top.compare_exchange(b, b + 1, Ordering::SeqCst, Ordering::Relaxed);
+            self.bottom.store(b + 1, Ordering::Relaxed);
+            won.is_ok().then_some(item)
+        }
+    }
+
+    fn push_to_bottom(&self, item: WorkItem) {
+        let b = self.bottom.load(Ordering::Relaxed);
+        self.slots[Self::mask(b as usize)].store(item.0, Ordering::Relaxed);
+        self.bottom.store(b + 1, Ordering::Release);
+    }
+
+    fn steal_from_top(&self) -> Option<WorkItem> {
+        let t = self.top.load(Ordering::Acquire);
+        fence(Ordering::SeqCst);
+        let b = self.bottom.load(Ordering::Acquire);
+        if t <= b {
+
+            
+        }
     }
 }
 
@@ -54,12 +109,18 @@ pub(crate) struct WorkChannel {
     _not_sync: PhantomData<Cell<()>>,
 }
 impl WorkChannel {
-    pub(crate) fn push(&self, item: WorkItem) {
-        todo!()
+    fn new(inner: Arc<WorkQueue>) -> Self {
+        Self {
+            inner,
+            _not_sync: Default::default(),
+        }
+    }
+    fn push(&self, item: WorkItem) {
+        self.inner.push_to_bottom(item);
     }
 
-    pub(crate) fn pop(&self) -> Option<WorkItem> {
-        todo!()
+    fn pop(&self) -> Option<WorkItem> {
+        self.inner.pop_from_bottom()
     }
 }
 
@@ -68,8 +129,12 @@ pub(crate) struct StealReceiver {
     inner: Arc<WorkQueue>,
 }
 impl StealReceiver {
-    pub(crate) fn steal(&self) -> Option<WorkItem> {
-        todo!()
+    fn new(inner: Arc<WorkQueue>) -> Self {
+        Self { inner }
+    }
+
+    fn steal(&self) -> Option<WorkItem> {
+        self.inner.steal_from_top()
     }
 }
 
@@ -85,5 +150,119 @@ impl Scheduler {
             (0..np).map(|_| WorkQueue::new().split()).unzip();
 
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn new_channel() -> (WorkChannel, StealReceiver) {
+        WorkQueue::new().split()
+    }
+
+    fn pop_all(channel: &WorkChannel) -> Vec<u32> {
+        std::iter::from_fn(|| channel.pop().map(|item| item.0)).collect()
+    }
+
+    fn steal_all(stealer: &StealReceiver) -> Vec<u32> {
+        std::iter::from_fn(|| stealer.steal().map(|item| item.0)).collect()
+    }
+
+    #[test]
+    fn empty_queue_yields_nothing() {
+        let (channel, stealer) = new_channel();
+        assert!(channel.pop().is_none());
+        assert!(stealer.steal().is_none());
+    }
+
+    #[test]
+    fn owner_pops_newest_first() {
+        let (channel, _stealer) = new_channel();
+        for i in 0..4 {
+            channel.push(WorkItem(i));
+        }
+        assert_eq!(pop_all(&channel), [3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn stealer_takes_oldest_first() {
+        let (channel, stealer) = new_channel();
+        for i in 0..4 {
+            channel.push(WorkItem(i));
+        }
+        assert_eq!(steal_all(&stealer), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn pop_and_steal_take_from_opposite_ends() {
+        let (channel, stealer) = new_channel();
+        for i in 0..3 {
+            channel.push(WorkItem(i));
+        }
+        assert_eq!(stealer.steal().map(|item| item.0), Some(0));
+        assert_eq!(channel.pop().map(|item| item.0), Some(2));
+        assert_eq!(channel.pop().map(|item| item.0), Some(1));
+        assert!(stealer.steal().is_none());
+        assert!(channel.pop().is_none());
+    }
+
+    #[test]
+    fn indices_wrap_around_the_buffer() {
+        let (channel, stealer) = new_channel();
+        let capacity = MAX_TASKS_PER_WORKER as u32;
+        for round in 0..3 {
+            let items = round * capacity..(round + 1) * capacity;
+            for i in items.clone() {
+                channel.push(WorkItem(i));
+            }
+            assert_eq!(steal_all(&stealer), items.collect::<Vec<_>>());
+        }
+    }
+
+    // The owner pushes in batches no larger than the capacity and drains each batch itself, while
+    // thieves steal concurrently. Every item must come out exactly once.
+    #[test]
+    fn concurrent_pop_and_steal_deliver_each_item_once() {
+        const TOTAL: u32 = 200_000;
+        const BATCH: u32 = 1024;
+        const THIEVES: usize = 4;
+
+        let (channel, stealer) = new_channel();
+        let done = AtomicBool::new(false);
+
+        let mut seen = std::thread::scope(|scope| {
+            let thieves: Vec<_> = (0..THIEVES)
+                .map(|_| {
+                    let stealer = stealer.clone();
+                    let done = &done;
+                    scope.spawn(move || {
+                        let mut stolen = Vec::new();
+                        while !done.load(Ordering::Acquire) {
+                            stolen.extend(steal_all(&stealer));
+                        }
+                        stolen
+                    })
+                })
+                .collect();
+
+            let mut popped = Vec::new();
+            for start in (0..TOTAL).step_by(BATCH as usize) {
+                for i in start..start + BATCH {
+                    channel.push(WorkItem(i));
+                }
+                popped.extend(pop_all(&channel));
+            }
+            done.store(true, Ordering::Release);
+
+            for thief in thieves {
+                popped.extend(thief.join().unwrap());
+            }
+            popped
+        });
+
+        seen.sort_unstable();
+        assert_eq!(seen, (0..TOTAL).collect::<Vec<_>>());
     }
 }
