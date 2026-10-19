@@ -10,7 +10,7 @@ impl Scheduler {
     pub fn new() -> Self {
         let np = available_parallelism().unwrap().get();
 
-        let (owner, stealers): (Vec<_>, Vec<_>) = (0..np).map(|_| queue::channel()).unzip();
+        let (owners, stealers): (Vec<_>, Vec<_>) = (0..np).map(|_| queue::channel()).unzip();
 
         todo!()
     }
