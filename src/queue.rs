@@ -156,7 +156,7 @@ mod loom_tests {
     use loom::thread;
 
     fn steal_all(stealer: &Stealer) -> Vec<u32> {
-        std::iter::from_fn(|| stealer.steal().map(|item| item.0)).collect()
+        std::iter::from_fn(|| stealer.steal().map(WorkItem::into_raw)).collect()
     }
 
     fn assert_each_once(mut seen: Vec<u32>, expected: impl IntoIterator<Item = u32>) {
@@ -169,10 +169,10 @@ mod loom_tests {
     fn loom_pop_and_steal_race_for_the_last_item() {
         loom::model(|| {
             let (owner, stealer) = channel();
-            owner.push(WorkItem(7));
+            owner.push(WorkItem::from_raw(7));
 
-            let thief = thread::spawn(move || stealer.steal().map(|item| item.0));
-            let popped = owner.pop().map(|item| item.0);
+            let thief = thread::spawn(move || stealer.steal().map(WorkItem::into_raw));
+            let popped = owner.pop().map(WorkItem::into_raw);
             let stolen = thief.join().unwrap();
 
             assert_each_once(popped.into_iter().chain(stolen).collect(), [7]);
@@ -186,10 +186,10 @@ mod loom_tests {
             let (owner, stealer) = channel();
 
             let thief = thread::spawn(move || steal_all(&stealer));
-            owner.push(WorkItem(0));
-            owner.push(WorkItem(1));
+            owner.push(WorkItem::from_raw(0));
+            owner.push(WorkItem::from_raw(1));
             let mut seen: Vec<u32> =
-                std::iter::from_fn(|| owner.pop().map(|item| item.0)).collect();
+                std::iter::from_fn(|| owner.pop().map(WorkItem::into_raw)).collect();
             seen.extend(thief.join().unwrap());
 
             assert_each_once(seen, 0..2);
@@ -201,20 +201,20 @@ mod loom_tests {
     fn loom_two_thieves_and_owner_deliver_each_item_once() {
         loom::model(|| {
             let (owner, stealer) = channel();
-            owner.push(WorkItem(0));
-            owner.push(WorkItem(1));
+            owner.push(WorkItem::from_raw(0));
+            owner.push(WorkItem::from_raw(1));
 
             let thieves: Vec<_> = (0..2)
                 .map(|_| {
                     let stealer = stealer.clone();
-                    thread::spawn(move || stealer.steal().map(|item| item.0))
+                    thread::spawn(move || stealer.steal().map(WorkItem::into_raw))
                 })
                 .collect();
-            let mut seen: Vec<u32> = owner.pop().map(|item| item.0).into_iter().collect();
+            let mut seen: Vec<u32> = owner.pop().map(WorkItem::into_raw).into_iter().collect();
             for thief in thieves {
                 seen.extend(thief.join().unwrap());
             }
-            seen.extend(std::iter::from_fn(|| owner.pop().map(|item| item.0)));
+            seen.extend(std::iter::from_fn(|| owner.pop().map(WorkItem::into_raw)));
 
             assert_each_once(seen, 0..2);
         });
@@ -227,11 +227,11 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn pop_all(owner: &Owner) -> Vec<u32> {
-        std::iter::from_fn(|| owner.pop().map(|item| item.into_raw())).collect()
+        std::iter::from_fn(|| owner.pop().map(WorkItem::into_raw)).collect()
     }
 
     fn steal_all(stealer: &Stealer) -> Vec<u32> {
-        std::iter::from_fn(|| stealer.steal().map(|item| item.into_raw())).collect()
+        std::iter::from_fn(|| stealer.steal().map(WorkItem::into_raw)).collect()
     }
 
     #[test]
@@ -265,9 +265,9 @@ mod tests {
         for i in 0..3 {
             owner.push(WorkItem::try_from(i).unwrap());
         }
-        assert_eq!(stealer.steal().map(|item| item.into_raw()), Some(0));
-        assert_eq!(owner.pop().map(|item| item.into_raw()), Some(2));
-        assert_eq!(owner.pop().map(|item| item.into_raw()), Some(1));
+        assert_eq!(stealer.steal().map(WorkItem::into_raw), Some(0));
+        assert_eq!(owner.pop().map(WorkItem::into_raw), Some(2));
+        assert_eq!(owner.pop().map(WorkItem::into_raw), Some(1));
         assert!(stealer.steal().is_none());
         assert!(owner.pop().is_none());
     }
