@@ -41,13 +41,13 @@ pub(crate) struct WorkItem {
     kind: JobKind,
 }
 
-struct JobHeader {
+pub(crate) struct JobHeader {
     /// We store the function as a raw function pointer that accepts raw bytes
     run: unsafe fn(*mut u8),
 }
 
 impl JobHeader {
-    fn new<F: FnOnce()>(_: &F) -> Self {
+    pub(crate) fn new<F: FnOnce()>(_: &F) -> Self {
         Self {
             run: Self::call::<F>,
         }

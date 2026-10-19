@@ -1,16 +1,13 @@
-use std::{
-    cell::Cell,
-    marker::PhantomData,
-    ops::Deref,
-    thread::{JoinHandle, available_parallelism},
-};
+use std::{cell::Cell, marker::PhantomData, ops::Deref};
 
 use crate::{
     jobs::WorkItem,
     sync::{Arc, AtomicIsize, AtomicU32, Ordering, fence},
 };
 
-#[repr(align(64))]
+use crate::CACHE_LINE;
+
+#[repr(align(128))]
 struct CacheAligned<T>(T);
 impl<T> Deref for CacheAligned<T> {
     type Target = T;
@@ -18,6 +15,8 @@ impl<T> Deref for CacheAligned<T> {
         &self.0
     }
 }
+// This is so we don't forget to change the align of [CacheAligned] in case we change the constant [CACHE_LINE]
+const _: () = assert!(align_of::<CacheAligned<u8>>() == CACHE_LINE);
 
 /// The maximum number of tasks that can be enqueued in a [WorkQueue]
 #[cfg(not(loom))]
