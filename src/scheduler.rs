@@ -4,13 +4,11 @@ use std::{
     thread::{JoinHandle, available_parallelism},
 };
 
-use crate::{queue, queue::Stealer};
-
-struct Arena;
+use crate::{arena::JobArena, queue, queue::Stealer};
 
 struct Scope<'s> {
     /// The bump arena used for allocating jobs in the scope and its nested child scopes
-    arena: &'s Arena,
+    arena: &'s JobArena,
     /// Counts up on spawning of new tasks and down to track the progress of the scope, work is complete when pending == 0
     pending: AtomicUsize,
     /// Stops the compiler shortening `'s`, so a job can't borrow a local that dies before the end of

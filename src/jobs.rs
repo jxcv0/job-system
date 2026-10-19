@@ -40,3 +40,53 @@ pub(crate) struct WorkItem {
     #[bits(4)]
     kind: JobKind,
 }
+
+struct JobHeader {
+    /// We store the function as a raw function pointer that accepts raw bytes
+    run: unsafe fn(*mut u8),
+}
+
+impl JobHeader {
+    fn new<F: FnOnce()>(_: &F) -> Self {
+        Self {
+            run: Self::call::<F>,
+        }
+    }
+
+    /// # Safety
+    ///
+    /// `p` must point to an initialized `F`, and must be called exactly once as a second call
+    /// would read a moved value
+    unsafe fn call<F: FnOnce()>(p: *mut u8) {
+        let f = unsafe { p.cast::<F>().read() };
+        f();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{cell::Cell, mem::ManuallyDrop};
+
+    // Runs `f` through a JobHeader the way a worker would, by its type-erased pointer
+    fn run_erased<F: FnOnce()>(f: F) {
+        let mut f = ManuallyDrop::new(f);
+        let header = JobHeader::new(&*f);
+        unsafe { (header.run)((&raw mut *f).cast()) };
+    }
+
+    #[test]
+    fn run_calls_the_closure() {
+        let ran = Cell::new(false);
+        run_erased(|| ran.set(true));
+        assert!(ran.get());
+    }
+
+    #[test]
+    fn run_passes_captured_values_to_the_closure() {
+        let sum = Cell::new(0);
+        let values = vec![1, 2, 3];
+        run_erased(|| sum.set(values.into_iter().sum()));
+        assert_eq!(sum.get(), 6);
+    }
+}

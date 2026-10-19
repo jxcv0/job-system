@@ -1,3 +1,4 @@
+mod arena;
 mod jobs;
 mod queue;
 mod scheduler;
