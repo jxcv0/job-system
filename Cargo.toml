@@ -6,3 +6,9 @@ authors = ["Jaya Micoud <jaya.micoud@gmail.com>"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

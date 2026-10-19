@@ -1,8 +1,11 @@
 use std::{
-    cell::Cell, marker::PhantomData, ops::Deref, sync::{
-        Arc, atomic::{AtomicIsize, AtomicU32, Ordering, fence},
-    }, thread::{JoinHandle, available_parallelism},
+    cell::Cell,
+    marker::PhantomData,
+    ops::Deref,
+    thread::{JoinHandle, available_parallelism},
 };
+
+use crate::sync::{Arc, AtomicIsize, AtomicU32, Ordering, fence};
 
 // Job types:
 // - Scoped. Finish at user defined scope (sync point). only need allocations to last until the end
@@ -22,7 +25,11 @@ impl<T> Deref for CacheAligned<T> {
 }
 
 /// The maximum number of tasks that can be enqueued in a [WorkQueue]
+#[cfg(not(loom))]
 const MAX_TASKS_PER_WORKER: usize = 4096;
+// loom tracks every atomic it models, so keep the buffer tiny under it.
+#[cfg(loom)]
+const MAX_TASKS_PER_WORKER: usize = 4;
 const _: () = assert!(MAX_TASKS_PER_WORKER.is_power_of_two());
 
 pub(crate) struct WorkItem(u32);
@@ -39,10 +46,10 @@ struct WorkQueue {
 }
 impl WorkQueue {
     fn new() -> Self {
-        let top = CacheAligned(AtomicIsize::from(0));
-        let bottom = CacheAligned(AtomicIsize::from(0));
+        let top = CacheAligned(AtomicIsize::new(0));
+        let bottom = CacheAligned(AtomicIsize::new(0));
         let slots: Box<_> = (0..MAX_TASKS_PER_WORKER)
-            .map(|_| AtomicU32::from(0))
+            .map(|_| AtomicU32::new(0))
             .collect();
         Self { top, bottom, slots }
     }
@@ -54,7 +61,7 @@ impl WorkQueue {
         (WorkChannel::new(inner.clone()), StealReceiver::new(inner))
     }
 
-    fn mask(index: usize) -> usize{
+    fn mask(index: usize) -> usize {
         index & (MAX_TASKS_PER_WORKER - 1)
     }
 
@@ -79,7 +86,9 @@ impl WorkQueue {
         } else {
             debug_assert!(t == b); // sanity
             // this is the last item so we are racing with thieves
-            let won = self.top.compare_exchange(b, b + 1, Ordering::SeqCst, Ordering::Relaxed);
+            let won = self
+                .top
+                .compare_exchange(b, b + 1, Ordering::SeqCst, Ordering::Relaxed);
             self.bottom.store(b + 1, Ordering::Relaxed);
             won.is_ok().then_some(item)
         }
@@ -102,7 +111,9 @@ impl WorkQueue {
         }
 
         let item = self.slots[Self::mask(t as usize)].load(Ordering::Relaxed);
-        self.top.compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed).ok()?;
+        self.top
+            .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed)
+            .ok()?;
         Some(WorkItem(item))
     }
 }
@@ -158,7 +169,78 @@ impl Scheduler {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use loom::thread;
+
+    fn steal_all(stealer: &StealReceiver) -> Vec<u32> {
+        std::iter::from_fn(|| stealer.steal().map(|item| item.0)).collect()
+    }
+
+    fn assert_each_once(mut seen: Vec<u32>, expected: impl IntoIterator<Item = u32>) {
+        seen.sort_unstable();
+        assert_eq!(seen, expected.into_iter().collect::<Vec<_>>());
+    }
+
+    // The owner and a thief race for the only item: exactly one of them gets it.
+    #[test]
+    fn loom_pop_and_steal_race_for_the_last_item() {
+        loom::model(|| {
+            let (channel, stealer) = WorkQueue::new().split();
+            channel.push(WorkItem(7));
+
+            let thief = thread::spawn(move || stealer.steal().map(|item| item.0));
+            let popped = channel.pop().map(|item| item.0);
+            let stolen = thief.join().unwrap();
+
+            assert_each_once(popped.into_iter().chain(stolen).collect(), [7]);
+        });
+    }
+
+    // A thief steals while the owner is still pushing, then the owner drains the rest.
+    #[test]
+    fn loom_steal_during_push_delivers_each_item_once() {
+        loom::model(|| {
+            let (channel, stealer) = WorkQueue::new().split();
+
+            let thief = thread::spawn(move || steal_all(&stealer));
+            channel.push(WorkItem(0));
+            channel.push(WorkItem(1));
+            let mut seen: Vec<u32> =
+                std::iter::from_fn(|| channel.pop().map(|item| item.0)).collect();
+            seen.extend(thief.join().unwrap());
+
+            assert_each_once(seen, 0..2);
+        });
+    }
+
+    // Two thieves and the owner all compete for two items.
+    #[test]
+    fn loom_two_thieves_and_owner_deliver_each_item_once() {
+        loom::model(|| {
+            let (channel, stealer) = WorkQueue::new().split();
+            channel.push(WorkItem(0));
+            channel.push(WorkItem(1));
+
+            let thieves: Vec<_> = (0..2)
+                .map(|_| {
+                    let stealer = stealer.clone();
+                    thread::spawn(move || stealer.steal().map(|item| item.0))
+                })
+                .collect();
+            let mut seen: Vec<u32> = channel.pop().map(|item| item.0).into_iter().collect();
+            for thief in thieves {
+                seen.extend(thief.join().unwrap());
+            }
+            seen.extend(std::iter::from_fn(|| channel.pop().map(|item| item.0)));
+
+            assert_each_once(seen, 0..2);
+        });
+    }
+}
+
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
