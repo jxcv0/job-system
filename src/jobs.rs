@@ -8,34 +8,28 @@
 
 use std::sync::atomic::AtomicUsize;
 
-#[derive(Debug)]
-pub(crate) enum JobError {
-    UnknownType { unknown_value: u32 },
-}
+use bitfield_struct::bitfield;
 
-#[derive(Clone, Copy, PartialEq, PartialOrd)]
-enum JobType {
-    Scoped = 0,
-    Unscoped = 1,
-    IoSubmission = 2,
-    IoCompletion = 3,
-    Max,
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[repr(u8)]
+enum JobKind {
+    Scoped,
+    Unscoped,
+    IoSubmission,
+    IoCompletion,
 }
-impl TryFrom<u32> for JobType {
-    type Error = JobError;
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
-        if value < JobType::Max as u32 {
-            let table = [
-                Self::Scoped,
-                Self::Unscoped,
-                Self::IoSubmission,
-                Self::IoCompletion,
-            ];
-            Ok(table[value as usize])
-        } else {
-            Err(JobError::UnknownType {
-                unknown_value: value,
-            })
+impl JobKind {
+    const fn into_bits(self) -> u8 {
+        self as _
+    }
+
+    const fn from_bits(value: u8) -> Self {
+        match value {
+            0 => Self::Scoped,
+            1 => Self::Unscoped,
+            2 => Self::IoSubmission,
+            3 => Self::IoCompletion,
+            _ => unreachable!(),
         }
     }
 }
@@ -44,31 +38,13 @@ struct ScopeGroup {
     completion_target: AtomicUsize,
 }
 
-// scheduler.par_for() {
-// }
-
-// A work item is a reference to an allocation that contains the actual Job
-// The top 4 bits are used to discriminate between job types
-pub(crate) struct WorkItem(u32);
-impl WorkItem {
-    fn job_type(&self) -> JobType {
-        JobType::try_from(self.0 >> 28).expect("invalid job type")
-    }
-
-    // Unchecked conversion to underlying type
-    pub(crate) fn into_raw(self) -> u32 {
-        self.0
-    }
-
-    // Unchecked conversion from underlying type
-    pub(crate) fn from_raw(raw: u32) -> Self {
-        Self(raw)
-    }
-}
-impl TryFrom<u32> for WorkItem {
-    type Error = JobError;
-    fn try_from(value: u32) -> Result<Self, JobError> {
-        let _ = JobType::try_from(value >> 28)?;
-        Ok(Self(value))
-    }
+// A work item is a slot in an arena plus a job kind
+#[bitfield(u32)]
+pub(crate) struct WorkItem {
+    #[bits(20)]
+    slot: u32,
+    #[bits(8)]
+    arena: u8,
+    #[bits(4)]
+    kind: JobKind,
 }

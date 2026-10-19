@@ -1,4 +1,7 @@
-use std::{sync::Arc, thread::{JoinHandle, available_parallelism}};
+use std::{
+    sync::Arc,
+    thread::{JoinHandle, available_parallelism},
+};
 
 use crate::{queue, queue::Stealer};
 
@@ -15,4 +18,3 @@ impl Scheduler {
         todo!()
     }
 }
-
