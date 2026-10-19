@@ -45,22 +45,6 @@ struct WorkQueue {
     slots: Box<[AtomicU32]>,
 }
 impl WorkQueue {
-    fn new() -> Self {
-        let top = CacheAligned(AtomicIsize::new(0));
-        let bottom = CacheAligned(AtomicIsize::new(0));
-        let slots: Box<_> = (0..MAX_TASKS_PER_WORKER)
-            .map(|_| AtomicU32::new(0))
-            .collect();
-        Self { top, bottom, slots }
-    }
-
-    // Split into a channel for pushing and popping tasks and a stealer that can be used by non-owners to steal
-    // tasks from this queue
-    fn split(self) -> (WorkChannel, StealReceiver) {
-        let inner = Arc::new(self);
-        (WorkChannel::new(inner.clone()), StealReceiver::new(inner))
-    }
-
     fn mask(index: usize) -> usize {
         index & (MAX_TASKS_PER_WORKER - 1)
     }
@@ -118,13 +102,27 @@ impl WorkQueue {
     }
 }
 
-pub(crate) struct WorkChannel {
+// Create a workqueue and return its channels
+pub(crate) fn channel() -> (Owner, Stealer) {
+    let top = CacheAligned(AtomicIsize::new(0));
+    let bottom = CacheAligned(AtomicIsize::new(0));
+    let slots: Box<_> = (0..MAX_TASKS_PER_WORKER)
+        .map(|_| AtomicU32::new(0))
+        .collect();
+    let queue = Arc::new(WorkQueue { top, bottom, slots });
+    (
+        Owner::new(queue.clone()),
+        Stealer::new(queue),
+    )
+}
+
+pub(crate) struct Owner {
     inner: Arc<WorkQueue>,
     // This is how the rustonomicon recommends disabling Sync but not Send
     // TODO: Change this once `impl !Sync` is available
     _not_sync: PhantomData<Cell<()>>,
 }
-impl WorkChannel {
+impl Owner {
     fn new(inner: Arc<WorkQueue>) -> Self {
         Self {
             inner,
@@ -141,10 +139,10 @@ impl WorkChannel {
 }
 
 #[derive(Clone)]
-pub(crate) struct StealReceiver {
+pub(crate) struct Stealer {
     inner: Arc<WorkQueue>,
 }
-impl StealReceiver {
+impl Stealer {
     fn new(inner: Arc<WorkQueue>) -> Self {
         Self { inner }
     }
@@ -154,27 +152,12 @@ impl StealReceiver {
     }
 }
 
-struct Scheduler {
-    threads: Vec<JoinHandle<()>>,
-    stealers: Arc<[StealReceiver]>,
-}
-impl Scheduler {
-    pub fn new() -> Self {
-        let np = available_parallelism().unwrap().get();
-
-        let (workers, stealers): (Vec<_>, Vec<_>) =
-            (0..np).map(|_| WorkQueue::new().split()).unzip();
-
-        todo!()
-    }
-}
-
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
     use loom::thread;
 
-    fn steal_all(stealer: &StealReceiver) -> Vec<u32> {
+    fn steal_all(stealer: &Stealer) -> Vec<u32> {
         std::iter::from_fn(|| stealer.steal().map(|item| item.0)).collect()
     }
 
@@ -187,7 +170,7 @@ mod loom_tests {
     #[test]
     fn loom_pop_and_steal_race_for_the_last_item() {
         loom::model(|| {
-            let (channel, stealer) = WorkQueue::new().split();
+            let (channel, stealer) = channel();
             channel.push(WorkItem(7));
 
             let thief = thread::spawn(move || stealer.steal().map(|item| item.0));
@@ -202,7 +185,7 @@ mod loom_tests {
     #[test]
     fn loom_steal_during_push_delivers_each_item_once() {
         loom::model(|| {
-            let (channel, stealer) = WorkQueue::new().split();
+            let (channel, stealer) = channel();
 
             let thief = thread::spawn(move || steal_all(&stealer));
             channel.push(WorkItem(0));
@@ -219,7 +202,7 @@ mod loom_tests {
     #[test]
     fn loom_two_thieves_and_owner_deliver_each_item_once() {
         loom::model(|| {
-            let (channel, stealer) = WorkQueue::new().split();
+            let (channel, stealer) = channel();
             channel.push(WorkItem(0));
             channel.push(WorkItem(1));
 
@@ -245,28 +228,24 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    fn new_channel() -> (WorkChannel, StealReceiver) {
-        WorkQueue::new().split()
-    }
-
-    fn pop_all(channel: &WorkChannel) -> Vec<u32> {
+    fn pop_all(channel: &Owner) -> Vec<u32> {
         std::iter::from_fn(|| channel.pop().map(|item| item.0)).collect()
     }
 
-    fn steal_all(stealer: &StealReceiver) -> Vec<u32> {
+    fn steal_all(stealer: &Stealer) -> Vec<u32> {
         std::iter::from_fn(|| stealer.steal().map(|item| item.0)).collect()
     }
 
     #[test]
     fn empty_queue_yields_nothing() {
-        let (channel, stealer) = new_channel();
+        let (channel, stealer) = channel();
         assert!(channel.pop().is_none());
         assert!(stealer.steal().is_none());
     }
 
     #[test]
     fn owner_pops_newest_first() {
-        let (channel, _stealer) = new_channel();
+        let (channel, _stealer) = channel();
         for i in 0..4 {
             channel.push(WorkItem(i));
         }
@@ -275,7 +254,7 @@ mod tests {
 
     #[test]
     fn stealer_takes_oldest_first() {
-        let (channel, stealer) = new_channel();
+        let (channel, stealer) = channel();
         for i in 0..4 {
             channel.push(WorkItem(i));
         }
@@ -284,7 +263,7 @@ mod tests {
 
     #[test]
     fn pop_and_steal_take_from_opposite_ends() {
-        let (channel, stealer) = new_channel();
+        let (channel, stealer) = channel();
         for i in 0..3 {
             channel.push(WorkItem(i));
         }
@@ -297,7 +276,7 @@ mod tests {
 
     #[test]
     fn indices_wrap_around_the_buffer() {
-        let (channel, stealer) = new_channel();
+        let (channel, stealer) = channel();
         let capacity = MAX_TASKS_PER_WORKER as u32;
         for round in 0..3 {
             let items = round * capacity..(round + 1) * capacity;
@@ -316,7 +295,7 @@ mod tests {
         const TOTAL: u32 = 200 * BATCH;
         const THIEVES: usize = 4;
 
-        let (channel, stealer) = new_channel();
+        let (channel, stealer) = channel();
         let done = AtomicBool::new(false);
 
         let mut seen = std::thread::scope(|scope| {
