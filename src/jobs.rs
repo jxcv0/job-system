@@ -6,11 +6,9 @@
 // - IoSubmission Jobs that submit tasks to the OS.
 // - IoCompletion jobs that finalize IO Submissions after the OS is done.
 
-use std::sync::atomic::AtomicUsize;
-
 use bitfield_struct::bitfield;
 
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[derive(Debug)]
 #[repr(u8)]
 enum JobKind {
     Scoped,
@@ -34,17 +32,11 @@ impl JobKind {
     }
 }
 
-struct ScopeGroup {
-    completion_target: AtomicUsize,
-}
-
 // A work item is a slot in an arena plus a job kind
 #[bitfield(u32)]
 pub(crate) struct WorkItem {
-    #[bits(20)]
+    #[bits(28)]
     slot: u32,
-    #[bits(8)]
-    arena: u8,
     #[bits(4)]
     kind: JobKind,
 }
