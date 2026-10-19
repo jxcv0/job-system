@@ -6,7 +6,7 @@ use crate::{
     sync::{AtomicU32, Ordering, UnsafeCell},
 };
 
-const fn closure_offset<F>() -> usize {
+pub(crate) const fn closure_offset<F>() -> usize {
     size_of::<JobHeader>().next_multiple_of(align_of::<F>())
 }
 
@@ -26,7 +26,8 @@ pub(crate) struct ScopeArena {
     cursor: AtomicU32,
 }
 
-enum ScopeArenaError {
+#[derive(Debug)]
+pub(crate) enum ScopeArenaError {
     OutOfMemory,
 }
 
@@ -51,7 +52,7 @@ impl ScopeArena {
     }
 
     /// Allocate n cache lines
-    fn alloc(&self, n: u32) -> Result<u32, ScopeArenaError> {
+    pub(crate) fn alloc(&self, n: u32) -> Result<u32, ScopeArenaError> {
         let start = self.cursor.fetch_add(n, Ordering::Relaxed);
         match start.checked_add(n) {
             Some(end) if end as usize <= self.lines.len() => Ok(start),
@@ -60,9 +61,43 @@ impl ScopeArena {
         }
     }
 
+    pub(crate) fn alloc_job<F: FnOnce() + Send>(&self, f: F) -> Result<u32, ScopeArenaError> {
+        let line = self.alloc(lines_for::<F>())?;
+        // SAFETY: TODO
+        self.with_line_mut(line, |p| unsafe {
+            // Write the header into the slot
+            p.cast::<JobHeader>().write(JobHeader::new(&f));
+            // Write the function into the offset
+            p.add(closure_offset::<F>()).cast::<F>().write(f);
+        });
+        Ok(line)
+    }
+
     /// Calls `f` with a pointer to the first byte of line `index`
+    #[cfg(loom)]
     fn with_line_mut<R>(&self, index: u32, f: impl FnOnce(*mut u8) -> R) -> R {
         self.lines[index as usize].0.with_mut(|p| f(p.cast()))
+    }
+
+    /// Calls `f` with a pointer to the first byte of line `index`
+    #[cfg(not(loom))]
+    fn with_line_mut<R>(&self, index: u32, f: impl FnOnce(*mut u8) -> R) -> R {
+        assert!((index as usize) < self.lines.len());
+        // Derived from the whole slice so a job may run on into the following lines
+        let p = self.lines.as_ptr().cast::<u8>().cast_mut();
+        f(unsafe { p.add(index as usize * CACHE_LINE) })
+    }
+
+    /// Runs the job that `alloc_job` wrote at `line`
+    ///
+    /// # Safety
+    ///
+    /// `line` must have come from `alloc_job`, and each job must be run exactly once
+    pub(crate) unsafe fn run_job(&self, line: u32) {
+        self.with_line_mut(line, |p| unsafe {
+            let header = p.cast::<JobHeader>().read();
+            (header.run)(p)
+        });
     }
 }
 
@@ -90,6 +125,51 @@ mod loom_tests {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn allocated_job_runs_its_closure() {
+        let arena = ScopeArena::new(4);
+        let ran = AtomicUsize::new(0);
+        let line = arena.alloc_job(|| ran.store(1, Ordering::Relaxed)).unwrap();
+        unsafe { arena.run_job(line) };
+        assert_eq!(ran.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn allocated_job_receives_its_captured_values() {
+        let arena = ScopeArena::new(4);
+        let sum = AtomicUsize::new(0);
+        let values = vec![1, 2, 3];
+        let line = arena
+            .alloc_job(|| sum.store(values.into_iter().sum(), Ordering::Relaxed))
+            .unwrap();
+        unsafe { arena.run_job(line) };
+        assert_eq!(sum.load(Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn job_spanning_several_lines_does_not_overlap_the_next_job() {
+        let arena = ScopeArena::new(8);
+        let big_sum = &AtomicUsize::new(0);
+        let small_ran = AtomicUsize::new(0);
+        let big = [1u8; 3 * CACHE_LINE];
+        let big_line = arena
+            .alloc_job(move || {
+                let total = big.iter().map(|&b| b as usize).sum();
+                big_sum.store(total, Ordering::Relaxed)
+            })
+            .unwrap();
+        let small_line = arena
+            .alloc_job(|| small_ran.store(1, Ordering::Relaxed))
+            .unwrap();
+        unsafe {
+            arena.run_job(small_line);
+            arena.run_job(big_line);
+        }
+        assert_eq!(small_ran.load(Ordering::Relaxed), 1);
+        assert_eq!(big_sum.load(Ordering::Relaxed), 3 * CACHE_LINE);
+    }
 
     #[test]
     fn first_allocation_starts_at_line_zero() {

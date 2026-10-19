@@ -8,6 +8,8 @@
 
 use bitfield_struct::bitfield;
 
+use crate::arena::closure_offset;
+
 #[derive(Debug)]
 #[repr(u8)]
 enum JobKind {
@@ -45,7 +47,7 @@ pub(crate) const MAX_SLOTS: u32 = 1 << WorkItem::SLOT_BITS;
 
 pub(crate) struct JobHeader {
     /// We store the function as a raw function pointer that accepts raw bytes
-    run: unsafe fn(*mut u8),
+    pub(crate) run: unsafe fn(*mut u8),
 }
 
 impl JobHeader {
@@ -59,8 +61,9 @@ impl JobHeader {
     ///
     /// `p` must point to an initialized `F`, and must be called exactly once as a second call
     /// would read a moved value
-    unsafe fn call<F: FnOnce()>(p: *mut u8) {
-        let f = unsafe { p.cast::<F>().read() };
+    unsafe fn call<F: FnOnce()>(header: *mut u8) {
+        // Read the function from the offset past the header then call it
+        let f = unsafe { header.add(closure_offset::<F>()).cast::<F>().read() };
         f();
     }
 }
@@ -70,11 +73,21 @@ mod tests {
     use super::*;
     use std::{cell::Cell, mem::ManuallyDrop};
 
-    // Runs `f` through a JobHeader the way a worker would, by its type-erased pointer
+    // A header followed by its closure, laid out as the arena lays out a job
+    #[repr(C)]
+    struct Job<F> {
+        header: JobHeader,
+        f: F,
+    }
+
+    // Runs `f` through a JobHeader the way a worker would, by the header's type-erased address
     fn run_erased<F: FnOnce()>(f: F) {
-        let mut f = ManuallyDrop::new(f);
-        let header = JobHeader::new(&*f);
-        unsafe { (header.run)((&raw mut *f).cast()) };
+        assert_eq!(std::mem::offset_of!(Job<F>, f), closure_offset::<F>());
+        let mut job = ManuallyDrop::new(Job {
+            header: JobHeader::new(&f),
+            f,
+        });
+        unsafe { (job.header.run)((&raw mut *job).cast()) };
     }
 
     #[test]
