@@ -32,7 +32,7 @@ pub(crate) enum ScopeArenaError {
 }
 
 impl ScopeArena {
-    fn new(capacity: u32) -> Self {
+    pub(crate) fn new(capacity: u32) -> Self {
         assert!(capacity <= MAX_SLOTS, "capacity exceeds WorkItem slot bits");
         #[cfg(not(loom))]
         let lines = {

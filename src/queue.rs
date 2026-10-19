@@ -126,11 +126,11 @@ impl Owner {
             _not_sync: Default::default(),
         }
     }
-    fn push(&self, item: WorkItem) {
+    pub(crate) fn push(&self, item: WorkItem) {
         self.inner.push_to_bottom(item);
     }
 
-    fn pop(&self) -> Option<WorkItem> {
+    pub(crate) fn pop(&self) -> Option<WorkItem> {
         self.inner.pop_from_bottom()
     }
 }

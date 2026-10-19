@@ -12,7 +12,7 @@ use crate::arena::closure_offset;
 
 #[derive(Debug)]
 #[repr(u8)]
-enum JobKind {
+pub(crate) enum JobKind {
     Scoped,
     Unscoped,
     IoSubmission,
@@ -38,9 +38,9 @@ impl JobKind {
 #[bitfield(u32)]
 pub(crate) struct WorkItem {
     #[bits(28)]
-    slot: u32,
+    pub(crate) slot: u32,
     #[bits(4)]
-    kind: JobKind,
+    pub(crate) kind: JobKind,
 }
 
 pub(crate) const MAX_SLOTS: u32 = 1 << WorkItem::SLOT_BITS;
