@@ -5,15 +5,10 @@ use std::{
     thread::{JoinHandle, available_parallelism},
 };
 
-use crate::sync::{Arc, AtomicIsize, AtomicU32, Ordering, fence};
-
-// Job types:
-// - Scoped. Finish at user defined scope (sync point). only need allocations to last until the end
-// of that scope so can use a bump allocator that is reset at the end of the scope
-// - Unscoped. Continue until they are complete so require an allocation that lasts as long as the
-// job does
-// - IoSubmission Jobs that submit tasks to the kernel.
-// - IoCompletion jobs that finalize IO Submissions after the kernel is done.
+use crate::{
+    jobs::WorkItem,
+    sync::{Arc, AtomicIsize, AtomicU32, Ordering, fence},
+};
 
 #[repr(align(64))]
 struct CacheAligned<T>(T);
@@ -32,7 +27,9 @@ const MAX_TASKS_PER_WORKER: usize = 4096;
 const MAX_TASKS_PER_WORKER: usize = 4;
 const _: () = assert!(MAX_TASKS_PER_WORKER.is_power_of_two());
 
-pub(crate) struct WorkItem(u32);
+fn mask(index: usize) -> usize {
+    index & (MAX_TASKS_PER_WORKER - 1)
+}
 
 // Chase-Lev circular work-stealing queue
 // Work items are indexes into the buffer that stores the actual allocation for the function and
@@ -45,10 +42,6 @@ struct WorkQueue {
     slots: Box<[AtomicU32]>,
 }
 impl WorkQueue {
-    fn mask(index: usize) -> usize {
-        index & (MAX_TASKS_PER_WORKER - 1)
-    }
-
     fn pop_from_bottom(&self) -> Option<WorkItem> {
         let b = self.bottom.load(Ordering::Relaxed) - 1;
         self.bottom.store(b, Ordering::Relaxed);
@@ -61,9 +54,9 @@ impl WorkQueue {
             return None;
         }
 
-        let index = Self::mask(b as usize);
+        let index = mask(b as usize);
         let slot = &self.slots[index];
-        let item = WorkItem(slot.load(Ordering::Relaxed));
+        let item = WorkItem::from_raw(slot.load(Ordering::Relaxed));
 
         if t < b {
             Some(item)
@@ -80,7 +73,15 @@ impl WorkQueue {
 
     fn push_to_bottom(&self, item: WorkItem) {
         let b = self.bottom.load(Ordering::Relaxed);
-        self.slots[Self::mask(b as usize)].store(item.0, Ordering::Relaxed);
+
+        // Check if queue is full
+        // TODO: This is where we would decide to resize when we eventually implement that
+        debug_assert!(
+            b - self.top.load(Ordering::Relaxed) < MAX_TASKS_PER_WORKER as isize,
+            "work queue full"
+        );
+
+        self.slots[mask(b as usize)].store(item.into_raw(), Ordering::Relaxed);
         self.bottom.store(b + 1, Ordering::Release);
     }
 
@@ -94,11 +95,11 @@ impl WorkQueue {
             return None;
         }
 
-        let item = self.slots[Self::mask(t as usize)].load(Ordering::Relaxed);
+        let item = self.slots[mask(t as usize)].load(Ordering::Relaxed);
         self.top
             .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed)
             .ok()?;
-        Some(WorkItem(item))
+        Some(WorkItem::from_raw(item))
     }
 }
 
@@ -110,10 +111,7 @@ pub(crate) fn channel() -> (Owner, Stealer) {
         .map(|_| AtomicU32::new(0))
         .collect();
     let queue = Arc::new(WorkQueue { top, bottom, slots });
-    (
-        Owner::new(queue.clone()),
-        Stealer::new(queue),
-    )
+    (Owner::new(queue.clone()), Stealer::new(queue))
 }
 
 pub(crate) struct Owner {
@@ -229,11 +227,11 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn pop_all(owner: &Owner) -> Vec<u32> {
-        std::iter::from_fn(|| owner.pop().map(|item| item.0)).collect()
+        std::iter::from_fn(|| owner.pop().map(|item| item.into_raw())).collect()
     }
 
     fn steal_all(stealer: &Stealer) -> Vec<u32> {
-        std::iter::from_fn(|| stealer.steal().map(|item| item.0)).collect()
+        std::iter::from_fn(|| stealer.steal().map(|item| item.into_raw())).collect()
     }
 
     #[test]
@@ -247,7 +245,7 @@ mod tests {
     fn owner_pops_newest_first() {
         let (owner, _stealer) = channel();
         for i in 0..4 {
-            owner.push(WorkItem(i));
+            owner.push(WorkItem::try_from(i).unwrap());
         }
         assert_eq!(pop_all(&owner), [3, 2, 1, 0]);
     }
@@ -256,7 +254,7 @@ mod tests {
     fn stealer_takes_oldest_first() {
         let (owner, stealer) = channel();
         for i in 0..4 {
-            owner.push(WorkItem(i));
+            owner.push(WorkItem::try_from(i).unwrap());
         }
         assert_eq!(steal_all(&stealer), [0, 1, 2, 3]);
     }
@@ -265,11 +263,11 @@ mod tests {
     fn pop_and_steal_take_from_opposite_ends() {
         let (owner, stealer) = channel();
         for i in 0..3 {
-            owner.push(WorkItem(i));
+            owner.push(WorkItem::try_from(i).unwrap());
         }
-        assert_eq!(stealer.steal().map(|item| item.0), Some(0));
-        assert_eq!(owner.pop().map(|item| item.0), Some(2));
-        assert_eq!(owner.pop().map(|item| item.0), Some(1));
+        assert_eq!(stealer.steal().map(|item| item.into_raw()), Some(0));
+        assert_eq!(owner.pop().map(|item| item.into_raw()), Some(2));
+        assert_eq!(owner.pop().map(|item| item.into_raw()), Some(1));
         assert!(stealer.steal().is_none());
         assert!(owner.pop().is_none());
     }
@@ -281,7 +279,7 @@ mod tests {
         for round in 0..3 {
             let items = round * capacity..(round + 1) * capacity;
             for i in items.clone() {
-                owner.push(WorkItem(i));
+                owner.push(WorkItem::try_from(i).unwrap());
             }
             assert_eq!(steal_all(&stealer), items.collect::<Vec<_>>());
         }
@@ -316,7 +314,7 @@ mod tests {
             let mut popped = Vec::new();
             for start in (0..TOTAL).step_by(BATCH as usize) {
                 for i in start..start + BATCH {
-                    owner.push(WorkItem(i));
+                    owner.push(WorkItem::try_from(i).unwrap());
                 }
                 popped.extend(pop_all(&owner));
             }
