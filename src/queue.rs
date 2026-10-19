@@ -95,10 +95,15 @@ impl WorkQueue {
         let t = self.top.load(Ordering::Acquire);
         fence(Ordering::SeqCst);
         let b = self.bottom.load(Ordering::Acquire);
-        if t <= b {
 
-            
+        // Check if queue is empty
+        if t >= b {
+            return None;
         }
+
+        let item = self.slots[Self::mask(t as usize)].load(Ordering::Relaxed);
+        self.top.compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed).ok()?;
+        Some(WorkItem(item))
     }
 }
 
@@ -225,8 +230,8 @@ mod tests {
     // thieves steal concurrently. Every item must come out exactly once.
     #[test]
     fn concurrent_pop_and_steal_deliver_each_item_once() {
-        const TOTAL: u32 = 200_000;
         const BATCH: u32 = 1024;
+        const TOTAL: u32 = 200 * BATCH;
         const THIEVES: usize = 4;
 
         let (channel, stealer) = new_channel();
