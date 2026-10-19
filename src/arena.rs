@@ -1,6 +1,10 @@
 use std::{cell::UnsafeCell, mem::MaybeUninit};
 
-use crate::{CACHE_LINE, jobs::JobHeader, sync::AtomicU32};
+use crate::{
+    CACHE_LINE,
+    jobs::{JobHeader, MAX_SLOTS},
+    sync::{AtomicU32, Ordering},
+};
 
 const fn closure_offset<F>() -> usize {
     size_of::<JobHeader>().next_multiple_of(align_of::<F>())
@@ -26,12 +30,24 @@ enum ScopeArenaError {
 
 impl ScopeArena {
     fn new(capacity: u32) -> Self {
-        todo!()
+        assert!(capacity <= MAX_SLOTS, "capacity exceeds WorkItem slot bits");
+        let lines = Box::new_uninit_slice(capacity as usize);
+        // SAFETY: a Line is only MaybeUninit bytes, so uninitialised memory is a valid Line
+        let lines = unsafe { lines.assume_init() };
+        Self {
+            lines,
+            cursor: AtomicU32::new(0),
+        }
     }
 
     /// Allocate n cache lines
     fn alloc(&self, n: u32) -> Result<u32, ScopeArenaError> {
-        todo!()
+        let start = self.cursor.fetch_add(n, Ordering::Relaxed);
+        match start.checked_add(n) {
+            Some(end) if end as usize <= self.lines.len() => Ok(start),
+            // TODO: Consider resizing in future
+            _ => Err(ScopeArenaError::OutOfMemory),
+        }
     }
 }
 

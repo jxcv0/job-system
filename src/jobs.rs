@@ -41,6 +41,8 @@ pub(crate) struct WorkItem {
     kind: JobKind,
 }
 
+pub(crate) const MAX_SLOTS: u32 = 1 << WorkItem::SLOT_BITS;
+
 pub(crate) struct JobHeader {
     /// We store the function as a raw function pointer that accepts raw bytes
     run: unsafe fn(*mut u8),
