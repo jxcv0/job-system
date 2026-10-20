@@ -192,7 +192,11 @@ impl Drop for Scheduler {
 mod tests {
     use super::*;
     use std::{
-        sync::atomic::{AtomicUsize, Ordering},
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -201,6 +205,68 @@ mod tests {
         while !done() {
             std::hint::spin_loop();
         }
+    }
+
+    // Runs `f` against a fresh Scheduler on its own thread and returns the message it panicked
+    // with. Gives up after a deadline, so a scope that never returns fails rather than hangs.
+    fn panic_message(f: impl FnOnce(&mut Scheduler) + Send + 'static) -> Option<String> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut scheduler = Scheduler::new();
+            let payload = catch_unwind(AssertUnwindSafe(|| f(&mut scheduler))).err();
+            let message = payload.map(|p| match p.downcast::<&str>() {
+                Ok(s) => s.to_string(),
+                Err(_) => "<not a &str payload>".to_string(),
+            });
+            tx.send(message).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("scope did not return")
+    }
+
+    #[test]
+    fn panic_in_the_scope_closure_reaches_the_caller() {
+        let message = panic_message(|scheduler| scheduler.scope(|_| panic!("boom")));
+        assert_eq!(message.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn panic_in_a_job_reaches_the_caller() {
+        let message = panic_message(|scheduler| {
+            let started = AtomicBool::new(false);
+            scheduler.scope(|s| {
+                s.spawn(|_| {
+                    started.store(true, Ordering::Relaxed);
+                    panic!("boom");
+                });
+                // Keep the main thread out of the queue, so a worker runs the job
+                spin_until(|| started.load(Ordering::Relaxed));
+            });
+        });
+        assert_eq!(message.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn scope_closure_panic_waits_for_running_jobs() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let job_finished = finished.clone();
+        let message = panic_message(move |scheduler| {
+            let started = AtomicBool::new(false);
+            scheduler.scope(|s| {
+                s.spawn(|_| {
+                    started.store(true, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(100));
+                    job_finished.store(true, Ordering::Relaxed);
+                });
+                spin_until(|| started.load(Ordering::Relaxed));
+                panic!("boom");
+            });
+        });
+        assert_eq!(message.as_deref(), Some("boom"));
+        assert!(
+            finished.load(Ordering::Relaxed),
+            "scope unwound before its job finished"
+        );
     }
 
     #[test]
