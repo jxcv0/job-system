@@ -1,7 +1,9 @@
 use std::{
+    any::Any,
     cell::RefCell,
     marker::PhantomData,
-    sync::Arc,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    sync::{Arc, Mutex},
     thread::{JoinHandle, available_parallelism},
 };
 
@@ -44,13 +46,13 @@ fn worker_loop(
     set_owner(owner);
 
     while !stop_flag.load(Ordering::Relaxed) {
-        tick(&arena, &stealers);
+        try_one_run(&arena, &stealers);
         std::hint::spin_loop();
     }
 }
 
 // Get the next work item from TLS owner or from a [Stealer] and then run it
-fn tick(arena: &ScopeArena, stealers: &[Stealer]) {
+fn try_one_run(arena: &ScopeArena, stealers: &[Stealer]) {
     if let Some(item) = next_work_item() {
         run_work_item(item, arena);
     } else if let Some(item) = steal_work_item(stealers) {
@@ -73,6 +75,8 @@ struct Scope<'s, 'env: 's> {
     arena: &'s ScopeArena,
     /// Counts up on spawning of new tasks and down to track the progress of the scope, work is complete when pending == 0
     pending: AtomicU32,
+    /// Somewhere to store errors we get while executing jobs in the scope
+    panic: Mutex<Option<Box<dyn Any + Send>>>,
     /// Stops the compiler shortening `'s`, so a job can't borrow a loca that dies before the end of
     /// the scope
     _invariant: PhantomData<&'s mut &'s ()>,
@@ -84,6 +88,7 @@ impl<'s, 'env> Scope<'s, 'env> {
         Self {
             arena,
             pending: AtomicU32::new(0),
+            panic: Default::default(),
             _invariant: Default::default(),
             _env: Default::default(),
         }
@@ -98,7 +103,13 @@ impl<'s, 'env> Scope<'s, 'env> {
         let slot = self
             .arena
             .alloc_job(move || {
-                f(self);
+                let result = catch_unwind(AssertUnwindSafe(|| f(self)));
+
+                if let Err(e) = result {
+                    let mut panic = self.panic.lock().unwrap();
+                    panic.get_or_insert(e);
+                }
+
                 self.pending.fetch_sub(1, Ordering::Release);
             })
             .expect("arena out of memory");
@@ -160,11 +171,20 @@ impl Scheduler {
         F: for<'s> FnOnce(&'s Scope<'s, 'env>),
     {
         let scope = Scope::new(&self.arena);
-        f(&scope);
+        let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
 
         while scope.pending.load(Ordering::Acquire) > 0 {
-            tick(&self.arena, &self.stealers);
+            try_one_run(&self.arena, &self.stealers);
             std::hint::spin_loop();
+        }
+
+        if let Err(e) = result {
+            resume_unwind(e);
+        }
+
+        let mut panic = scope.panic.lock().unwrap();
+        if let Some(e) = panic.take() {
+            resume_unwind(e);
         }
     }
 }
