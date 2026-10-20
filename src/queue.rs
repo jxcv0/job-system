@@ -144,7 +144,7 @@ impl Stealer {
         Self { inner }
     }
 
-    fn steal(&self) -> Option<WorkItem> {
+    pub(crate) fn steal(&self) -> Option<WorkItem> {
         self.inner.steal_from_top()
     }
 }

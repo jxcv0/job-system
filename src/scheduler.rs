@@ -29,8 +29,9 @@ fn next_work_item() -> Option<WorkItem> {
     LOCAL.with(|l| l.borrow().as_ref().unwrap().pop())
 }
 
-fn steal_work(stealers: Arc<[Stealer]>) -> Option<WorkItem> {
-    todo!()
+/// Steal some work from another thread
+fn steal_work_item(stealers: &[Stealer]) -> Option<WorkItem> {
+    stealers.iter().find_map(Stealer::steal)
 }
 
 fn worker_loop(owner: Owner, stealers: Arc<[Stealer]>, arena: Arc<ScopeArena>) {
@@ -38,13 +39,21 @@ fn worker_loop(owner: Owner, stealers: Arc<[Stealer]>, arena: Arc<ScopeArena>) {
 
     loop {
         if let Some(item) = next_work_item() {
-            match item.kind() {
-                JobKind::Scoped => unsafe { arena.run_job(item.slot()) },
-                _ => unreachable!(),
-            }
-        } else if let Some(item) = steal_work(stealers.clone()) {
-            todo!()
+            run_work_item(item, &arena);
+        } else if let Some(item) = steal_work_item(&stealers) {
+            run_work_item(item, &arena);
+        } else {
+            std::hint::spin_loop();
         }
+    }
+}
+
+fn run_work_item(item: WorkItem, arena: &ScopeArena) {
+    match item.kind() {
+        // SAFETY: every queued item came from alloc_job, and a popped/stolen item is never
+        // queued again, so each job runs exactly once
+        JobKind::Scoped => unsafe { arena.run_job(item.slot()) },
+        _ => unreachable!(),
     }
 }
 
@@ -137,13 +146,9 @@ impl Scheduler {
         f(&scope);
 
         while scope.pending.load(Ordering::Acquire) > 0 {
-            let item = LOCAL.with(|l| l.borrow().as_ref().unwrap().pop());
+            let item = next_work_item();
             match item {
-                // SAFETY: every queued item came from alloc_job, and a popped item is never
-                // queued again, so each job runs exactly once
-                Some(item) => unsafe {
-                    self.arena.run_job(item.slot());
-                },
+                Some(item) => run_work_item(item, &self.arena),
                 None => std::hint::spin_loop(),
             }
         }
