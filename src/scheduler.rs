@@ -35,19 +35,25 @@ fn steal_work_item(stealers: &[Stealer]) -> Option<WorkItem> {
 }
 
 fn worker_loop(owner: Owner, stealers: Arc<[Stealer]>, arena: Arc<ScopeArena>) {
+    // Store the owner in our TLS
     set_owner(owner);
 
     loop {
-        if let Some(item) = next_work_item() {
-            run_work_item(item, &arena);
-        } else if let Some(item) = steal_work_item(&stealers) {
-            run_work_item(item, &arena);
-        } else {
-            std::hint::spin_loop();
-        }
+        tick(&arena, &stealers);
+        std::hint::spin_loop();
     }
 }
 
+// Get the next work item from TLS owner or from a [Stealer] and then run it
+fn tick(arena: &ScopeArena, stealers: &[Stealer]) {
+    if let Some(item) = next_work_item() {
+        run_work_item(item, arena);
+    } else if let Some(item) = steal_work_item(stealers) {
+        run_work_item(item, arena);
+    }
+}
+
+// Run a work item
 fn run_work_item(item: WorkItem, arena: &ScopeArena) {
     match item.kind() {
         // SAFETY: every queued item came from alloc_job, and a popped/stolen item is never
@@ -78,6 +84,7 @@ impl<'s, 'env> Scope<'s, 'env> {
         }
     }
 
+    /// Push the work item into the queue and increment the pending counter
     fn spawn<F>(&'s self, f: F)
     where
         F: FnOnce(&'s Scope<'s, 'env>) + Send + 's,
@@ -118,6 +125,7 @@ impl Scheduler {
         // store the main thread's Owner in TLS
         set_owner(owners.next().unwrap());
 
+        // FIXME: Size this correctly
         let arena = Arc::new(ScopeArena::new(4096));
 
         // Spawn the threads
@@ -138,6 +146,7 @@ impl Scheduler {
         }
     }
 
+    // Set up a scope and then help the worker threads out until the scope is complete
     pub fn scope<'env, F>(&'env mut self, f: F)
     where
         F: for<'s> FnOnce(&'s Scope<'s, 'env>),
@@ -146,11 +155,8 @@ impl Scheduler {
         f(&scope);
 
         while scope.pending.load(Ordering::Acquire) > 0 {
-            let item = next_work_item();
-            match item {
-                Some(item) => run_work_item(item, &self.arena),
-                None => std::hint::spin_loop(),
-            }
+            tick(&self.arena, &self.stealers);
+            std::hint::spin_loop();
         }
     }
 }
@@ -163,7 +169,17 @@ impl Drop for Scheduler {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    fn spin_until(done: impl Fn() -> bool) {
+        while !done() {
+            std::hint::spin_loop();
+        }
+    }
 
     #[test]
     fn scope_with_no_jobs_returns() {
@@ -200,6 +216,39 @@ mod tests {
             });
         });
         assert_eq!(ran.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn main_thread_steals_children_spawned_by_busy_workers() {
+        let mut scheduler = Scheduler::new();
+        let workers = scheduler.threads.len();
+        let main = thread::current().id();
+        let started = AtomicUsize::new(0);
+        let ran = AtomicUsize::new(0);
+        let ran_on_main = AtomicUsize::new(0);
+        scheduler.scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|s| {
+                    // Hold every worker here, so only the main thread is free to run the child
+                    started.fetch_add(1, Ordering::Relaxed);
+                    spin_until(|| started.load(Ordering::Relaxed) == workers);
+                    s.spawn(|_| {
+                        if thread::current().id() == main {
+                            ran_on_main.fetch_add(1, Ordering::Relaxed);
+                        }
+                        ran.fetch_add(1, Ordering::Relaxed);
+                    });
+                    // Give up in the end, so a main thread that never steals fails rather than hangs
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    spin_until(|| {
+                        ran.load(Ordering::Relaxed) == workers || Instant::now() > deadline
+                    });
+                });
+            }
+            // The main thread only starts taking jobs once every worker holds one
+            spin_until(|| started.load(Ordering::Relaxed) == workers);
+        });
+        assert_eq!(ran_on_main.load(Ordering::Relaxed), workers);
     }
 
     #[test]
