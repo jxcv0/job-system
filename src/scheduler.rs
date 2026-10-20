@@ -9,7 +9,7 @@ use crate::{
     arena::ScopeArena,
     jobs::{JobKind, WorkItem},
     queue::{self, Owner, Stealer},
-    sync::{AtomicU32, Ordering},
+    sync::{AtomicBool, AtomicU32, Ordering},
 };
 
 thread_local! {
@@ -34,11 +34,16 @@ fn steal_work_item(stealers: &[Stealer]) -> Option<WorkItem> {
     stealers.iter().find_map(Stealer::steal)
 }
 
-fn worker_loop(owner: Owner, stealers: Arc<[Stealer]>, arena: Arc<ScopeArena>) {
+fn worker_loop(
+    owner: Owner,
+    stealers: Arc<[Stealer]>,
+    arena: Arc<ScopeArena>,
+    stop_flag: Arc<AtomicBool>,
+) {
     // Store the owner in our TLS
     set_owner(owner);
 
-    loop {
+    while !stop_flag.load(Ordering::Relaxed) {
         tick(&arena, &stealers);
         std::hint::spin_loop();
     }
@@ -84,7 +89,7 @@ impl<'s, 'env> Scope<'s, 'env> {
         }
     }
 
-    /// Push the work item into the queue and increment the pending counter
+    /// Increment the pending count, allocate the work item then push to the queue
     fn spawn<F>(&'s self, f: F)
     where
         F: FnOnce(&'s Scope<'s, 'env>) + Send + 's,
@@ -111,6 +116,7 @@ struct Scheduler {
     threads: Vec<JoinHandle<()>>,
     stealers: Arc<[Stealer]>,
     arena: Arc<ScopeArena>,
+    stop_flag: Arc<AtomicBool>,
     // Only one thread may own the Scheduler
     _not_send: PhantomData<*const ()>,
 }
@@ -125,28 +131,30 @@ impl Scheduler {
         // store the main thread's Owner in TLS
         set_owner(owners.next().unwrap());
 
-        // FIXME: Size this correctly
+        // FIXME: Work out how to size this
         let arena = Arc::new(ScopeArena::new(4096));
+        let stop_flag = Arc::new(AtomicBool::new(false));
 
         // Spawn the threads
         let threads = owners
             .map(|owner| {
                 let stealers = stealers.clone();
                 let arena = arena.clone();
-                std::thread::spawn(move || worker_loop(owner, stealers, arena))
+                let stop_flag = stop_flag.clone();
+                std::thread::spawn(move || worker_loop(owner, stealers, arena, stop_flag))
             })
             .collect();
 
         Self {
             threads,
             stealers,
-            // TODO: Work out how to size this
             arena,
+            stop_flag,
             _not_send: Default::default(),
         }
     }
 
-    // Set up a scope and then help the worker threads out until the scope is complete
+    /// Set up a scope and then help the worker threads out until the scope is complete
     pub fn scope<'env, F>(&'env mut self, f: F)
     where
         F: for<'s> FnOnce(&'s Scope<'s, 'env>),
@@ -162,7 +170,21 @@ impl Scheduler {
 }
 impl Drop for Scheduler {
     fn drop(&mut self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+        let mut panic = None;
+
+        for t in self.threads.drain(..) {
+            if let Err(e) = t.join() {
+                panic.get_or_insert(e);
+            }
+        }
         LOCAL.with(|l| *l.borrow_mut() = None);
+
+        if let Some(e) = panic
+            && !std::thread::panicking()
+        {
+            std::panic::resume_unwind(e);
+        }
     }
 }
 
@@ -270,5 +292,14 @@ mod tests {
         drop(Scheduler::new());
         let mut scheduler = Scheduler::new();
         scheduler.scope(|_| {});
+    }
+
+    #[test]
+    fn drop_waits_for_every_worker_to_exit() {
+        let scheduler = Scheduler::new();
+        // Each worker holds a clone of the arena until it exits
+        let arena = Arc::downgrade(&scheduler.arena);
+        drop(scheduler);
+        assert!(arena.upgrade().is_none());
     }
 }
