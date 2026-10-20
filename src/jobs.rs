@@ -46,7 +46,7 @@ pub(crate) struct WorkItem {
 pub(crate) const MAX_SLOTS: u32 = 1 << WorkItem::SLOT_BITS;
 
 pub(crate) struct JobHeader {
-    /// We store the function as a raw function pointer that accepts raw bytes
+    /// We store the call as a raw function pointer that accepts the header as raw bytes, see [call]
     pub(crate) run: unsafe fn(*mut u8),
 }
 
@@ -57,6 +57,9 @@ impl JobHeader {
         }
     }
 
+    /// Set up the run function pointer so that it pulls the closure out of the memory after the
+    /// header and calls the function
+    ///
     /// # Safety
     ///
     /// `p` must point to an initialized `F`, and must be called exactly once as a second call

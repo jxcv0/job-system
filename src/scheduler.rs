@@ -1,4 +1,9 @@
-use std::{cell::RefCell, marker::PhantomData, sync::Arc, thread::available_parallelism};
+use std::{
+    cell::RefCell,
+    marker::PhantomData,
+    sync::Arc,
+    thread::{JoinHandle, available_parallelism},
+};
 
 use crate::{
     arena::ScopeArena,
@@ -11,9 +16,35 @@ thread_local! {
     static LOCAL: RefCell<Option<Owner>> = const { RefCell::new(None) };
 }
 
-fn worker_loop(stealers: Arc<[Stealer]>) {
+/// Set the owner in TLS
+fn set_owner(owner: Owner) {
+    LOCAL.with(move |l| {
+        assert!(l.borrow().is_none(), "This thread already has a scheduler");
+        *l.borrow_mut() = Some(owner)
+    });
+}
+
+/// Get the next work item from the owner in TLS
+fn next_work_item() -> Option<WorkItem> {
+    LOCAL.with(|l| l.borrow().as_ref().unwrap().pop())
+}
+
+fn steal_work(stealers: Arc<[Stealer]>) -> Option<WorkItem> {
+    todo!()
+}
+
+fn worker_loop(owner: Owner, stealers: Arc<[Stealer]>, arena: Arc<ScopeArena>) {
+    set_owner(owner);
+
     loop {
-        todo!()
+        if let Some(item) = next_work_item() {
+            match item.kind() {
+                JobKind::Scoped => unsafe { arena.run_job(item.slot()) },
+                _ => unreachable!(),
+            }
+        } else if let Some(item) = steal_work(stealers.clone()) {
+            todo!()
+        }
     }
 }
 
@@ -22,7 +53,7 @@ struct Scope<'s, 'env: 's> {
     arena: &'s ScopeArena,
     /// Counts up on spawning of new tasks and down to track the progress of the scope, work is complete when pending == 0
     pending: AtomicU32,
-    /// Stops the compiler shortening `'s`, so a job can't borrow a local that dies before the end of
+    /// Stops the compiler shortening `'s`, so a job can't borrow a loca that dies before the end of
     /// the scope
     _invariant: PhantomData<&'s mut &'s ()>,
     /// Data from outside the scope that jobs may borrow
@@ -61,9 +92,9 @@ impl<'s, 'env> Scope<'s, 'env> {
 }
 
 struct Scheduler {
-    // threads: Vec<JoinHandle<()>>,
+    threads: Vec<JoinHandle<()>>,
     stealers: Arc<[Stealer]>,
-    arena: ScopeArena,
+    arena: Arc<ScopeArena>,
     // Only one thread may own the Scheduler
     _not_send: PhantomData<*const ()>,
 }
@@ -73,16 +104,27 @@ impl Scheduler {
 
         let (owners, stealers): (Vec<_>, Vec<_>) = (0..np).map(|_| queue::channel()).unzip();
         let mut owners = owners.into_iter();
+        let stealers: Arc<[_]> = stealers.into();
 
         // store the main thread's Owner in TLS
-        LOCAL.with(|l| {
-            assert!(l.borrow().is_none(), "This thread already has a scheduler");
-            *l.borrow_mut() = owners.next()
-        });
+        set_owner(owners.next().unwrap());
+
+        let arena = Arc::new(ScopeArena::new(4096));
+
+        // Spawn the threads
+        let threads = owners
+            .map(|owner| {
+                let stealers = stealers.clone();
+                let arena = arena.clone();
+                std::thread::spawn(move || worker_loop(owner, stealers, arena))
+            })
+            .collect();
 
         Self {
-            stealers: stealers.into(),
-            arena: ScopeArena::new(4096),
+            threads,
+            stealers,
+            // TODO: Work out how to size this
+            arena,
             _not_send: Default::default(),
         }
     }
