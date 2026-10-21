@@ -19,7 +19,7 @@ thread_local! {
 }
 
 /// Set the owner in TLS
-fn set_owner(owner: Owner) {
+fn set_worker_tls(owner: Owner) {
     LOCAL.with(move |l| {
         assert!(l.borrow().is_none(), "This thread already has a scheduler");
         *l.borrow_mut() = Some(owner)
@@ -42,8 +42,8 @@ fn worker_loop(
     arena: Arc<ScopeArena>,
     stop_flag: Arc<AtomicBool>,
 ) {
-    // Store the owner in our TLS
-    set_owner(owner);
+    // Store local worker data
+    set_worker_tls(owner);
 
     while !stop_flag.load(Ordering::Relaxed) {
         try_one_run(&arena, &stealers);
@@ -77,7 +77,7 @@ struct Scope<'s, 'env: 's> {
     pending: AtomicU32,
     /// Somewhere to store errors we get while executing jobs in the scope
     panic: Mutex<Option<Box<dyn Any + Send>>>,
-    /// Stops the compiler shortening `'s`, so a job can't borrow a loca that dies before the end of
+    /// Stops the compiler shortening `'s`, so a job can't borrow a local that dies before the end of
     /// the scope
     _invariant: PhantomData<&'s mut &'s ()>,
     /// Data from outside the scope that jobs may borrow
@@ -123,6 +123,13 @@ impl<'s, 'env> Scope<'s, 'env> {
     }
 }
 
+// Exclude a workers own stealer from the set of stealers it has access to
+// Also rotates the stealers so that the search starts at the first queue after this workers stealer
+fn stealers_for_worker(stealers: &[Stealer], index: usize) -> Arc<[Stealer]> {
+    let (before, after) = stealers.split_at(index);
+    after[1..].iter().chain(before).cloned().collect()
+}
+
 struct Scheduler {
     threads: Vec<JoinHandle<()>>,
     stealers: Arc<[Stealer]>,
@@ -136,11 +143,12 @@ impl Scheduler {
         let np = available_parallelism().unwrap().get();
 
         let (owners, stealers): (Vec<_>, Vec<_>) = (0..np).map(|_| queue::channel()).unzip();
-        let mut owners = owners.into_iter();
+        let mut owners = owners.into_iter().enumerate();
         let stealers: Arc<[_]> = stealers.into();
 
-        // store the main thread's Owner in TLS
-        set_owner(owners.next().unwrap());
+        // store the main thread's worker info
+        let (main_index, main_owner) = owners.next().unwrap();
+        set_worker_tls(main_owner);
 
         // FIXME: Work out how to size this
         let arena = Arc::new(ScopeArena::new(4096));
@@ -148,13 +156,15 @@ impl Scheduler {
 
         // Spawn the threads
         let threads = owners
-            .map(|owner| {
-                let stealers = stealers.clone();
+            .map(|(index, owner)| {
+                let stealers = stealers_for_worker(&stealers, index);
                 let arena = arena.clone();
                 let stop_flag = stop_flag.clone();
                 std::thread::spawn(move || worker_loop(owner, stealers, arena, stop_flag))
             })
             .collect();
+
+        let stealers = stealers_for_worker(&stealers, main_index);
 
         Self {
             threads,
@@ -387,5 +397,44 @@ mod tests {
         let arena = Arc::downgrade(&scheduler.arena);
         drop(scheduler);
         assert!(arena.upgrade().is_none());
+    }
+
+    // Makes `n` queues, each holding the items listed for it, so a steal shows which queue it hit
+    fn queues_holding(items: impl Fn(usize) -> Vec<u32>, n: usize) -> (Vec<Owner>, Vec<Stealer>) {
+        let (owners, stealers): (Vec<_>, Vec<_>) = (0..n).map(|_| queue::channel()).unzip();
+        for (i, owner) in owners.iter().enumerate() {
+            for bits in items(i) {
+                owner.push(WorkItem::from_bits(bits));
+            }
+        }
+        (owners, stealers)
+    }
+
+    #[test]
+    fn stealers_for_worker_start_after_the_worker_and_wrap_around() {
+        let n = 4;
+        for index in 0..n {
+            // Each queue holds its own index
+            let (_owners, stealers) = queues_holding(|i| vec![i as u32], n);
+            let stolen: Vec<_> = stealers_for_worker(&stealers, index)
+                .iter()
+                .map(|s| s.steal().unwrap().into_bits())
+                .collect();
+            let expected: Vec<_> = (1..n).map(|k| ((index + k) % n) as u32).collect();
+            assert_eq!(stolen, expected, "worker {index}");
+        }
+    }
+
+    #[test]
+    fn worker_never_steals_from_its_own_queue() {
+        let n = 4;
+        for index in 0..n {
+            // Only this worker's own queue holds anything
+            let (_owners, stealers) =
+                queues_holding(|i| if i == index { vec![1, 2] } else { vec![] }, n);
+            for stealer in stealers_for_worker(&stealers, index).iter() {
+                assert!(stealer.steal().is_none(), "worker {index} stole its own job");
+            }
+        }
     }
 }
