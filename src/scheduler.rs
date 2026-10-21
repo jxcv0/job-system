@@ -384,6 +384,38 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_scopes_can_spawn_more_jobs_in_total_than_the_arena_holds() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counted = ran.clone();
+        // Each scope fits in the arena on its own, but together they overflow it
+        let message = panic_message(move |scheduler| {
+            for _ in 0..10 {
+                scheduler.scope(|s| {
+                    for _ in 0..1000 {
+                        s.spawn(|_| {
+                            counted.fetch_add(1, Ordering::Relaxed);
+                        });
+                    }
+                });
+            }
+        });
+        assert_eq!(message, None);
+        assert_eq!(ran.load(Ordering::Relaxed), 10_000);
+    }
+
+    #[test]
+    fn spawning_past_the_end_of_the_arena_reaches_the_caller() {
+        let message = panic_message(|scheduler| {
+            scheduler.scope(|s| {
+                for _ in 0..10_000 {
+                    s.spawn(|_| {});
+                }
+            });
+        });
+        assert_eq!(message.as_deref(), Some("arena out of memory"));
+    }
+
+    #[test]
     fn thread_can_create_a_new_scheduler_after_dropping_one() {
         drop(Scheduler::new());
         let mut scheduler = Scheduler::new();

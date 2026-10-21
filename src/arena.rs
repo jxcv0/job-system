@@ -202,6 +202,15 @@ mod tests {
     }
 
     #[test]
+    fn reset_makes_the_whole_arena_available_again() {
+        let arena = ScopeArena::new(4);
+        assert!(matches!(arena.alloc(4), Ok(0)));
+        // SAFETY: nothing was written to the lines, so no job is left unrun
+        unsafe { arena.reset() };
+        assert!(matches!(arena.alloc(4), Ok(0)));
+    }
+
+    #[test]
     fn allocation_larger_than_the_arena_is_out_of_memory() {
         let arena = ScopeArena::new(4);
         assert!(matches!(arena.alloc(5), Err(ScopeArenaError::OutOfMemory)));
