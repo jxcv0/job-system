@@ -63,6 +63,7 @@ impl ScopeArena {
 
     pub(crate) fn alloc_job<F: FnOnce() + Send>(&self, f: F) -> Result<u32, ScopeArenaError> {
         let line = self.alloc(lines_for::<F>())?;
+        assert!(align_of::<F>() <= CACHE_LINE);
         // SAFETY: TODO
         self.with_line_mut(line, |p| unsafe {
             // Write the header into the slot
