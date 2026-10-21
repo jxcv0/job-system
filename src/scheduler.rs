@@ -99,27 +99,31 @@ impl<'s, 'env> Scope<'s, 'env> {
     where
         F: FnOnce(&'s Scope<'s, 'env>) + Send + 's,
     {
-        self.pending.fetch_add(1, Ordering::Relaxed);
-        let slot = self
-            .arena
-            .alloc_job(move || {
-                let result = catch_unwind(AssertUnwindSafe(|| f(self)));
+        let result = self.arena.alloc_job(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| f(self)));
 
-                if let Err(e) = result {
-                    let mut panic = self.panic.lock().unwrap();
-                    panic.get_or_insert(e);
-                }
+            if let Err(e) = result {
+                let mut panic = self.panic.lock().unwrap();
+                panic.get_or_insert(e);
+            }
 
-                self.pending.fetch_sub(1, Ordering::Release);
-            })
-            .expect("arena out of memory");
-        let item = WorkItem::new().with_slot(slot).with_kind(JobKind::Scoped);
-        LOCAL.with(|l| {
-            l.borrow()
-                .as_ref()
-                .expect("spawn called off a worker")
-                .push(item)
-        })
+            self.pending.fetch_sub(1, Ordering::Release);
+        });
+
+        match result {
+            Ok(slot) => {
+                // Only increment pending if we managed to allocate the slot
+                self.pending.fetch_add(1, Ordering::Relaxed);
+                let item = WorkItem::new().with_slot(slot).with_kind(JobKind::Scoped);
+                LOCAL.with(|l| {
+                    l.borrow()
+                        .as_ref()
+                        .expect("spawn called off a worker")
+                        .push(item)
+                })
+            }
+            Err(_) => panic!("arena out of memory"),
+        }
     }
 }
 
@@ -187,6 +191,9 @@ impl Scheduler {
             try_one_run(&self.arena, &self.stealers);
             std::hint::spin_loop();
         }
+
+        // SAFETY: We know there are no more pending jobs so it is safe to reset the arena
+        unsafe { scope.arena.reset() };
 
         if let Err(e) = result {
             resume_unwind(e);
@@ -465,7 +472,10 @@ mod tests {
             let (_owners, stealers) =
                 queues_holding(|i| if i == index { vec![1, 2] } else { vec![] }, n);
             for stealer in stealers_for_worker(&stealers, index).iter() {
-                assert!(stealer.steal().is_none(), "worker {index} stole its own job");
+                assert!(
+                    stealer.steal().is_none(),
+                    "worker {index} stole its own job"
+                );
             }
         }
     }

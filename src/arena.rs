@@ -102,6 +102,13 @@ impl ScopeArena {
             (header.run)(p)
         });
     }
+
+    // Reset the arena
+    // SAFETY: This has a chance of "freeing" memory currently in use by jobs and must only be
+    // called once it is garanteed that no worker is using any memory from the arena when it is reset.
+    pub(crate) unsafe fn reset(&self) {
+        self.cursor.store(0, Ordering::Relaxed);
+    }
 }
 
 // SAFETY: alloc hands each line range to exactly one caller, so lines are never written concurrently
