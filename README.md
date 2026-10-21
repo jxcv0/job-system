@@ -17,6 +17,17 @@ a separate job store, so pushing a job costs no allocation. The deque only moves
 **Fixed capacity.** Each deque holds `MAX_TASKS_PER_WORKER` (4096) items. Overflow is caught by
 a `debug_assert!` in `push_to_bottom`; release builds do not check it yet.
 
+**`Scheduler` owns the workers.** It makes one deque per `available_parallelism()`. The thread
+that creates it is worker 0; every other deque gets its own thread. Each worker gets the other
+workers' `Stealer`s, rotated so the search starts at the next queue rather than all at the
+first. The worker loop pops its own deque, else steals, else spins. Dropping the `Scheduler`
+stops and joins the workers.
+
+**`Scheduler::scope` runs scoped jobs.** `Scope::spawn` copies the closure into the
+`ScopeArena` behind a type-erased `JobHeader` and pushes its line index. While the scope has
+jobs pending, the calling thread runs and steals work instead of blocking. A panic in the scope
+closure or in any job is carried back and re-raised on the caller once every job has finished.
+
 ## Job kinds
 
 - **Scoped**: must finish by a user-defined sync point. Their allocations only need to live
@@ -35,9 +46,11 @@ Unscoped jobs come first, then the others.
   size, copies indices `top..bottom` across at the same logical positions, and publishes it
   with `Release`. `steal` loads the pointer with `Acquire` after reading `bottom`. Old buffers
   may still be read by a thief, so they go on a retired list freed when the queue drops.
-- **`Scheduler`**: spawn one worker per `available_parallelism()`, give each its `Owner` and
-  every `Stealer`, and write the worker loop (pop, else steal, else sleep).
-- The job store and its allocators.
+- **Reset the `ScopeArena` when a scope ends.** Its cursor only grows, so repeated scopes
+  eventually fail with `OutOfMemory`. Its size (4096 lines) is also a placeholder.
+- **Idle workers spin.** Sleep when there is nothing to pop or steal.
+- **Unscoped and IO jobs.** The slab allocator with generation counters, and the IO job kinds.
+  `run_work_item` only handles `JobKind::Scoped` today.
 
 ## Testing
 

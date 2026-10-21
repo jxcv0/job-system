@@ -63,7 +63,9 @@ impl ScopeArena {
 
     pub(crate) fn alloc_job<F: FnOnce() + Send>(&self, f: F) -> Result<u32, ScopeArenaError> {
         let line = self.alloc(lines_for::<F>())?;
-        // SAFETY: TODO
+        // SAFETY: alloc gave this call sole use of lines_for::<F>() lines from `line`, all in
+        // bounds, so both writes fit and nothing else touches them. Lines are 128-aligned, so the
+        // header and, given align_of::<F>() <= CACHE_LINE, the closure are aligned
         self.with_line_mut(line, |p| unsafe {
             // Write the header into the slot
             p.cast::<JobHeader>().write(JobHeader::new(&f));
