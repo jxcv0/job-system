@@ -62,7 +62,7 @@ fn spawn_nested(c: &mut Criterion) {
 
 // Enough work per index that splitting can pay for itself
 fn work(i: usize) -> u64 {
-    (0..64u64).fold(i as u64, |acc, x| acc.wrapping_mul(31).wrapping_add(x))
+    (0..64u64).fold(i as u64, |acc, x| black_box(acc.wrapping_mul(31).wrapping_add(x)))
 }
 
 fn par_for(c: &mut Criterion) {
