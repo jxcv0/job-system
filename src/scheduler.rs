@@ -2,7 +2,9 @@ use std::{
     any::Any,
     cell::RefCell,
     marker::PhantomData,
+    num::NonZero,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    range::Range,
     sync::{Arc, Mutex},
     thread::{JoinHandle, available_parallelism},
 };
@@ -203,6 +205,38 @@ impl Scheduler {
         if let Some(e) = panic.take() {
             resume_unwind(e);
         }
+    }
+
+    fn split_range<'s, 'env, F>(
+        s: &'s Scope<'s, 'env>,
+        range: Range<usize>,
+        grain: NonZero<usize>,
+        f: &'s F,
+    ) where
+        F: Fn(usize) + Sync + 's,
+    {
+        assert!(range.end >= range.start);
+        let len = range.end - range.start;
+
+        if len <= grain.get() {
+            // we should try to make sure that we don't create false sharing here
+            range.iter().for_each(&f);
+        } else {
+            let halflen = len / 2;
+            let mid = range.start + halflen;
+            let (left, right) = (Range::from(range.start..mid), Range::from(mid..range.end));
+            s.spawn(move |s| {
+                Self::split_range(s, left, grain, f);
+            });
+            Self::split_range(s, right, grain, f);
+        }
+    }
+
+    fn par_for<F>(&mut self, range: Range<usize>, grain: NonZero<usize>, f: F)
+    where
+        F: Fn(usize) + Sync,
+    {
+        self.scope(|s| Self::split_range(s, range, grain, &f));
     }
 }
 impl Drop for Scheduler {
