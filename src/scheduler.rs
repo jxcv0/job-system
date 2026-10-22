@@ -2,7 +2,9 @@ use std::{
     any::Any,
     cell::RefCell,
     marker::PhantomData,
+    num::NonZero,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    range::Range,
     sync::{Arc, Mutex},
     thread::{JoinHandle, available_parallelism},
 };
@@ -203,6 +205,36 @@ impl Scheduler {
         if let Some(e) = panic.take() {
             resume_unwind(e);
         }
+    }
+
+    fn split_range<'s, 'env, F>(
+        s: &'s Scope<'s, 'env>,
+        range: Range<usize>,
+        grain: NonZero<usize>,
+        f: &'s F,
+    ) where
+        F: Fn(usize) + Sync + 's,
+    {
+        assert!(range.end >= range.start);
+        let len = range.end - range.start;
+
+        if len <= grain.get() {
+            // we should try to make sure that we don't create false sharing here
+            range.iter().for_each(&f);
+        } else {
+            let halflen = len / 2;
+            let mid = range.start + halflen;
+            let (left, right) = (Range::from(range.start..mid), Range::from(mid..range.end));
+            s.spawn(move |s| Self::split_range(s, left, grain, f));
+            Self::split_range(s, right, grain, f);
+        }
+    }
+
+    fn par_for<F>(&mut self, range: Range<usize>, grain: NonZero<usize>, f: F)
+    where
+        F: Fn(usize) + Sync,
+    {
+        self.scope(|s| Self::split_range(s, range, grain, &f));
     }
 }
 impl Drop for Scheduler {
@@ -420,6 +452,52 @@ mod tests {
             });
         });
         assert_eq!(message.as_deref(), Some("arena out of memory"));
+    }
+
+    // Runs par_for over `range` and returns how many times each index in 0..len was visited
+    fn visits(range: std::ops::Range<usize>, grain: usize, len: usize) -> Vec<usize> {
+        let hits: Arc<Vec<AtomicUsize>> = Arc::new((0..len).map(|_| AtomicUsize::new(0)).collect());
+        let counted = hits.clone();
+        let message = panic_message(move |scheduler| {
+            scheduler.par_for(Range::from(range), NonZero::new(grain).unwrap(), |i| {
+                counted[i].fetch_add(1, Ordering::Relaxed);
+            });
+        });
+        assert_eq!(message, None);
+        hits.iter().map(|h| h.load(Ordering::Relaxed)).collect()
+    }
+
+    #[test]
+    fn par_for_visits_every_index_exactly_once() {
+        assert_eq!(visits(0..1000, 7, 1000), vec![1; 1000]);
+    }
+
+    #[test]
+    fn par_for_visits_only_the_indices_in_a_range_not_starting_at_zero() {
+        let expected: Vec<_> = (0..1000).map(|i| usize::from(i >= 300)).collect();
+        assert_eq!(visits(300..1000, 16, 1000), expected);
+    }
+
+    #[test]
+    fn par_for_runs_a_range_smaller_than_the_grain() {
+        assert_eq!(visits(0..5, 64, 5), vec![1; 5]);
+    }
+
+    #[test]
+    fn par_for_over_an_empty_range_visits_nothing() {
+        assert_eq!(visits(0..0, 1, 0), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn panic_in_a_par_for_body_reaches_the_caller() {
+        let message = panic_message(|scheduler| {
+            scheduler.par_for(Range::from(0..100), NonZero::new(4).unwrap(), |i| {
+                if i == 57 {
+                    panic!("boom");
+                }
+            });
+        });
+        assert_eq!(message.as_deref(), Some("boom"));
     }
 
     #[test]
