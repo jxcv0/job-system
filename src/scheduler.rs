@@ -72,7 +72,7 @@ fn run_work_item(item: WorkItem, arena: &ScopeArena) {
     }
 }
 
-struct Scope<'s, 'env: 's> {
+pub struct Scope<'s, 'env: 's> {
     /// The bump arena used for allocating jobs in the scope and its nested child scopes
     arena: &'s ScopeArena,
     /// Counts up on spawning of new tasks and down to track the progress of the scope, work is complete when pending == 0
@@ -97,7 +97,7 @@ impl<'s, 'env> Scope<'s, 'env> {
     }
 
     /// Increment the pending count, allocate the work item then push to the queue
-    fn spawn<F>(&'s self, f: F)
+    pub fn spawn<F>(&'s self, f: F)
     where
         F: FnOnce(&'s Scope<'s, 'env>) + Send + 's,
     {
@@ -136,7 +136,7 @@ fn stealers_for_worker(stealers: &[Stealer], index: usize) -> Arc<[Stealer]> {
     after[1..].iter().chain(before).cloned().collect()
 }
 
-struct Scheduler {
+pub struct Scheduler {
     threads: Vec<JoinHandle<()>>,
     stealers: Arc<[Stealer]>,
     arena: Arc<ScopeArena>,
@@ -230,7 +230,7 @@ impl Scheduler {
         }
     }
 
-    fn par_for<F>(&mut self, range: Range<usize>, grain: NonZero<usize>, f: F)
+    pub fn par_for<F>(&mut self, range: Range<usize>, grain: NonZero<usize>, f: F)
     where
         F: Fn(usize) + Sync,
     {
