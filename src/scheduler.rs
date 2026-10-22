@@ -456,6 +456,52 @@ mod tests {
         assert_eq!(message.as_deref(), Some("arena out of memory"));
     }
 
+    // Runs par_for over `range` and returns how many times each index in 0..len was visited
+    fn visits(range: std::ops::Range<usize>, grain: usize, len: usize) -> Vec<usize> {
+        let hits: Arc<Vec<AtomicUsize>> = Arc::new((0..len).map(|_| AtomicUsize::new(0)).collect());
+        let counted = hits.clone();
+        let message = panic_message(move |scheduler| {
+            scheduler.par_for(Range::from(range), NonZero::new(grain).unwrap(), |i| {
+                counted[i].fetch_add(1, Ordering::Relaxed);
+            });
+        });
+        assert_eq!(message, None);
+        hits.iter().map(|h| h.load(Ordering::Relaxed)).collect()
+    }
+
+    #[test]
+    fn par_for_visits_every_index_exactly_once() {
+        assert_eq!(visits(0..1000, 7, 1000), vec![1; 1000]);
+    }
+
+    #[test]
+    fn par_for_visits_only_the_indices_in_a_range_not_starting_at_zero() {
+        let expected: Vec<_> = (0..1000).map(|i| usize::from(i >= 300)).collect();
+        assert_eq!(visits(300..1000, 16, 1000), expected);
+    }
+
+    #[test]
+    fn par_for_runs_a_range_smaller_than_the_grain() {
+        assert_eq!(visits(0..5, 64, 5), vec![1; 5]);
+    }
+
+    #[test]
+    fn par_for_over_an_empty_range_visits_nothing() {
+        assert_eq!(visits(0..0, 1, 0), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn panic_in_a_par_for_body_reaches_the_caller() {
+        let message = panic_message(|scheduler| {
+            scheduler.par_for(Range::from(0..100), NonZero::new(4).unwrap(), |i| {
+                if i == 57 {
+                    panic!("boom");
+                }
+            });
+        });
+        assert_eq!(message.as_deref(), Some("boom"));
+    }
+
     #[test]
     fn thread_can_create_a_new_scheduler_after_dropping_one() {
         drop(Scheduler::new());
