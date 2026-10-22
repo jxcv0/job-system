@@ -67,6 +67,16 @@ RUSTFLAGS="--cfg loom" cargo test --release --lib loom
 
 CI runs both on every push to `main` and on pull requests.
 
+## Benchmarks
+
+```bash
+cargo bench
+```
+
+[Criterion](https://github.com/bheisler/criterion.rs) benches in `benches/scheduler.rs`: the cost
+of an empty scope, 1000 flat spawns, a 1024-leaf spawn tree, and `par_for` at several grain sizes
+against a sequential loop. Reports land in `target/criterion/`.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
