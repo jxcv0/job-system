@@ -207,6 +207,8 @@ impl Scheduler {
         }
     }
 
+    // TODO: Split the work evenly between threads by recursing up to log2(nthreads).
+    // TODO: Split again if greater than grain size when a worker steals a job.
     fn split_range<'s, 'env, F>(
         s: &'s Scope<'s, 'env>,
         range: Range<usize>,
