@@ -85,7 +85,7 @@ fn par_for(c: &mut Criterion) {
             let grain = NonZero::new(grain).unwrap();
             // black_box per index rather than a shared sum, so no atomic contention muddies it
             b.iter(|| {
-                scheduler.par_for((0..LEN).into(), grain, |i| {
+                scheduler.par_for((0..LEN).into(), Some(grain), |i| {
                     black_box(work(i));
                 })
             })

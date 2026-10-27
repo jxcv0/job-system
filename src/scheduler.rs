@@ -58,6 +58,7 @@ fn try_one_run(arena: &ScopeArena, stealers: &[Stealer]) {
     if let Some(item) = next_work_item() {
         run_work_item(item, arena);
     } else if let Some(item) = steal_work_item(stealers) {
+        // TODO: Split the work item first before starting one of the splits
         run_work_item(item, arena);
     }
 }
@@ -207,36 +208,47 @@ impl Scheduler {
         }
     }
 
-    // TODO: Split the work evenly between threads by recursing up to log2(nthreads).
-    // TODO: Split again if greater than grain size when a worker steals a job.
     fn split_range<'s, 'env, F>(
         s: &'s Scope<'s, 'env>,
         range: Range<usize>,
-        grain: NonZero<usize>,
+        max_grain: Option<NonZero<usize>>,
         f: &'s F,
+        max_depth: u32,
+        current_depth: u32,
     ) where
         F: Fn(usize) + Sync + 's,
     {
         assert!(range.end >= range.start);
         let len = range.end - range.start;
 
-        if len <= grain.get() {
-            // we should try to make sure that we don't create false sharing here
-            range.iter().for_each(&f);
-        } else {
+        if current_depth >= max_depth {
+            if let Some(max_grain) = max_grain
+                && len >= max_grain.get()
+            {
+                range.iter().for_each(&f);
+            }
+            let depth = current_depth + 1;
             let halflen = len / 2;
             let mid = range.start + halflen;
             let (left, right) = (Range::from(range.start..mid), Range::from(mid..range.end));
-            s.spawn(move |s| Self::split_range(s, left, grain, f));
-            Self::split_range(s, right, grain, f);
+            s.spawn(move |s| Self::split_range(s, left, max_grain, f, max_depth, depth));
+            Self::split_range(s, right, max_grain, f, max_depth, depth);
+        } else {
+            range.iter().for_each(&f);
         }
     }
 
-    pub fn par_for<F>(&mut self, range: Range<usize>, grain: NonZero<usize>, f: F)
+    pub fn par_for<F>(&mut self, range: Range<usize>, max_grain: Option<NonZero<usize>>, f: F)
     where
         F: Fn(usize) + Sync,
     {
-        self.scope(|s| Self::split_range(s, range, grain, &f));
+        let max_depth = self.threads.len().ilog2();
+        self.scope(|s| Self::split_range(s, range, max_grain, &f, max_depth, 0));
+    }
+}
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 impl Drop for Scheduler {
@@ -461,7 +473,7 @@ mod tests {
         let hits: Arc<Vec<AtomicUsize>> = Arc::new((0..len).map(|_| AtomicUsize::new(0)).collect());
         let counted = hits.clone();
         let message = panic_message(move |scheduler| {
-            scheduler.par_for(Range::from(range), NonZero::new(grain).unwrap(), |i| {
+            scheduler.par_for(Range::from(range), Some(NonZero::new(grain).unwrap()), |i| {
                 counted[i].fetch_add(1, Ordering::Relaxed);
             });
         });
@@ -493,7 +505,7 @@ mod tests {
     #[test]
     fn panic_in_a_par_for_body_reaches_the_caller() {
         let message = panic_message(|scheduler| {
-            scheduler.par_for(Range::from(0..100), NonZero::new(4).unwrap(), |i| {
+            scheduler.par_for(Range::from(0..100), Some(NonZero::new(4).unwrap()), |i| {
                 if i == 57 {
                     panic!("boom");
                 }
