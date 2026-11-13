@@ -3,6 +3,7 @@ mod jobs;
 mod queue;
 mod scheduler;
 mod sync;
+mod unscoped_slab;
 
 #[cfg(not(target_arch = "x86_64"))]
 compile_error!("job-system assumes x86_64 cache geometry");

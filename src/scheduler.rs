@@ -1,12 +1,5 @@
 use std::{
-    any::Any,
-    cell::RefCell,
-    marker::PhantomData,
-    num::NonZero,
-    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-    range::Range,
-    sync::{Arc, Mutex},
-    thread::{JoinHandle, available_parallelism},
+    any::Any, cell::RefCell, marker::PhantomData, num::NonZero, panic::{AssertUnwindSafe, catch_unwind, resume_unwind}, range::Range, sync::{Arc, Mutex}, thread::{JoinHandle, available_parallelism},
 };
 
 use crate::{
@@ -14,6 +7,7 @@ use crate::{
     jobs::{JobKind, WorkItem},
     queue::{self, Owner, Stealer},
     sync::{AtomicBool, AtomicU32, Ordering},
+    unscoped_slab::UnscopedSlab,
 };
 
 thread_local! {
@@ -48,19 +42,25 @@ fn worker_loop(
     set_worker_tls(owner);
 
     while !stop_flag.load(Ordering::Relaxed) {
-        try_one_run(&arena, &stealers);
-        std::hint::spin_loop();
+        if !try_one_run(&arena, &stealers) {
+            std::thread::yield_now();
+        }
     }
 }
 
 // Get the next work item from TLS owner or from a [Stealer] and then run it
-fn try_one_run(arena: &ScopeArena, stealers: &[Stealer]) {
+// Returns true if it found a job to run otherwise false, this is used to work out if the thread
+// should yield
+fn try_one_run(arena: &ScopeArena, stealers: &[Stealer]) -> bool {
     if let Some(item) = next_work_item() {
         run_work_item(item, arena);
+        return true;
     } else if let Some(item) = steal_work_item(stealers) {
         // TODO: Split the work item first before starting one of the splits
         run_work_item(item, arena);
+        return true;
     }
+    false
 }
 
 // Run a work item
@@ -69,6 +69,7 @@ fn run_work_item(item: WorkItem, arena: &ScopeArena) {
         // SAFETY: every queued item came from alloc_job, and a popped/stolen item is never
         // queued again, so each job runs exactly once
         JobKind::Scoped => unsafe { arena.run_job(item.slot()) },
+        JobKind::Unscoped => {}
         _ => unreachable!(),
     }
 }
@@ -76,6 +77,8 @@ fn run_work_item(item: WorkItem, arena: &ScopeArena) {
 pub struct Scope<'s, 'env: 's> {
     /// The bump arena used for allocating jobs in the scope and its nested child scopes
     arena: &'s ScopeArena,
+    /// Storage for unscoped and IO tasks
+    unscoped_slab: Mutex<UnscopedSlab>,
     /// Counts up on spawning of new tasks and down to track the progress of the scope, work is complete when pending == 0
     pending: AtomicU32,
     /// Somewhere to store errors we get while executing jobs in the scope
@@ -90,6 +93,7 @@ impl<'s, 'env> Scope<'s, 'env> {
     fn new(arena: &'s ScopeArena) -> Self {
         Self {
             arena,
+            unscoped_slab: Mutex::new(UnscopedSlab::new()),
             pending: AtomicU32::new(0),
             panic: Default::default(),
             _invariant: Default::default(),
@@ -98,7 +102,7 @@ impl<'s, 'env> Scope<'s, 'env> {
     }
 
     /// Increment the pending count, allocate the work item then push to the queue
-    pub fn spawn<F>(&'s self, f: F)
+    pub fn spawn_scoped<F>(&'s self, f: F)
     where
         F: FnOnce(&'s Scope<'s, 'env>) + Send + 's,
     {
@@ -127,6 +131,20 @@ impl<'s, 'env> Scope<'s, 'env> {
             }
             Err(_) => panic!("arena out of memory"),
         }
+    }
+
+    /// Allocate a work item for an unscoped task and push to the queue
+    pub fn spawn_unscoped<F>(&'s self, f: F)
+    where
+        F: FnOnce(&'s Scope<'s, 'env>) + Send + 's,
+    {
+        let item = WorkItem::new().with_kind(JobKind::Scoped);
+        LOCAL.with(|l| {
+            l.borrow()
+                .as_ref()
+                .expect("spawn called off a worker")
+                .push(item)
+        })
     }
 }
 
@@ -192,10 +210,10 @@ impl Scheduler {
 
         while scope.pending.load(Ordering::Acquire) > 0 {
             try_one_run(&self.arena, &self.stealers);
-            std::hint::spin_loop();
+            std::thread::yield_now();
         }
 
-        // SAFETY: We know there are no more pending jobs so it is safe to reset the arena
+        // SAFETY: We know there are no more pending jobs (scope.pending == 0) so it is safe to reset the arena
         unsafe { scope.arena.reset() };
 
         if let Err(e) = result {
@@ -206,6 +224,15 @@ impl Scheduler {
         if let Some(e) = panic.take() {
             resume_unwind(e);
         }
+    }
+
+    // Set up a task that a thread will pick up and run until it's complete or returns an error
+    // This differs from Scheduler::scope in that the scheduler will not track the completion of the
+    // task
+    pub fn unscoped<'env, F>(&'env mut self, f: F)
+    where
+        F: for<'s> FnOnce(),
+    {
     }
 
     fn split_range<'s, 'env, F>(
@@ -231,7 +258,7 @@ impl Scheduler {
             let halflen = len / 2;
             let mid = range.start + halflen;
             let (left, right) = (Range::from(range.start..mid), Range::from(mid..range.end));
-            s.spawn(move |s| Self::split_range(s, left, max_grain, f, max_depth, depth));
+            s.spawn_scoped(move |s| Self::split_range(s, left, max_grain, f, max_depth, depth));
             Self::split_range(s, right, max_grain, f, max_depth, depth);
         } else {
             range.iter().for_each(&f);
@@ -318,7 +345,7 @@ mod tests {
         let message = panic_message(|scheduler| {
             let started = AtomicBool::new(false);
             scheduler.scope(|s| {
-                s.spawn(|_| {
+                s.spawn_scoped(|_| {
                     started.store(true, Ordering::Relaxed);
                     panic!("boom");
                 });
@@ -336,7 +363,7 @@ mod tests {
         let message = panic_message(move |scheduler| {
             let started = AtomicBool::new(false);
             scheduler.scope(|s| {
-                s.spawn(|_| {
+                s.spawn_scoped(|_| {
                     started.store(true, Ordering::Relaxed);
                     thread::sleep(Duration::from_millis(100));
                     job_finished.store(true, Ordering::Relaxed);
@@ -364,7 +391,7 @@ mod tests {
         let ran = AtomicUsize::new(0);
         scheduler.scope(|s| {
             for _ in 0..3 {
-                s.spawn(|_| {
+                s.spawn_scoped(|_| {
                     ran.fetch_add(1, Ordering::Relaxed);
                 });
             }
@@ -377,10 +404,10 @@ mod tests {
         let mut scheduler = Scheduler::new();
         let ran = AtomicUsize::new(0);
         scheduler.scope(|s| {
-            s.spawn(|s| {
+            s.spawn_scoped(|s| {
                 ran.fetch_add(1, Ordering::Relaxed);
                 for _ in 0..2 {
-                    s.spawn(|_| {
+                    s.spawn_scoped(|_| {
                         ran.fetch_add(1, Ordering::Relaxed);
                     });
                 }
@@ -399,11 +426,11 @@ mod tests {
         let ran_on_main = AtomicUsize::new(0);
         scheduler.scope(|s| {
             for _ in 0..workers {
-                s.spawn(|s| {
+                s.spawn_scoped(|s| {
                     // Hold every worker here, so only the main thread is free to run the child
                     started.fetch_add(1, Ordering::Relaxed);
                     spin_until(|| started.load(Ordering::Relaxed) == workers);
-                    s.spawn(|_| {
+                    s.spawn_scoped(|_| {
                         if thread::current().id() == main {
                             ran_on_main.fetch_add(1, Ordering::Relaxed);
                         }
@@ -428,7 +455,7 @@ mod tests {
         let ran = AtomicUsize::new(0);
         for _ in 0..2 {
             scheduler.scope(|s| {
-                s.spawn(|_| {
+                s.spawn_scoped(|_| {
                     ran.fetch_add(1, Ordering::Relaxed);
                 });
             });
@@ -445,7 +472,7 @@ mod tests {
             for _ in 0..10 {
                 scheduler.scope(|s| {
                     for _ in 0..1000 {
-                        s.spawn(|_| {
+                        s.spawn_scoped(|_| {
                             counted.fetch_add(1, Ordering::Relaxed);
                         });
                     }
@@ -461,7 +488,7 @@ mod tests {
         let message = panic_message(|scheduler| {
             scheduler.scope(|s| {
                 for _ in 0..10_000 {
-                    s.spawn(|_| {});
+                    s.spawn_scoped(|_| {});
                 }
             });
         });
@@ -473,9 +500,13 @@ mod tests {
         let hits: Arc<Vec<AtomicUsize>> = Arc::new((0..len).map(|_| AtomicUsize::new(0)).collect());
         let counted = hits.clone();
         let message = panic_message(move |scheduler| {
-            scheduler.par_for(Range::from(range), Some(NonZero::new(grain).unwrap()), |i| {
-                counted[i].fetch_add(1, Ordering::Relaxed);
-            });
+            scheduler.par_for(
+                Range::from(range),
+                Some(NonZero::new(grain).unwrap()),
+                |i| {
+                    counted[i].fetch_add(1, Ordering::Relaxed);
+                },
+            );
         });
         assert_eq!(message, None);
         hits.iter().map(|h| h.load(Ordering::Relaxed)).collect()

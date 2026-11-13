@@ -24,7 +24,7 @@ fn spawn_flat(c: &mut Criterion) {
             let counter = AtomicU64::new(0);
             scheduler.scope(|s| {
                 for _ in 0..JOBS {
-                    s.spawn(|_| {
+                    s.spawn_scoped(|_| {
                         counter.fetch_add(1, Ordering::Relaxed);
                     });
                 }
@@ -40,7 +40,7 @@ fn spawn_tree<'s, 'env>(s: &'s Scope<'s, 'env>, depth: u32, leaves: &'env Atomic
     if depth == 0 {
         leaves.fetch_add(1, Ordering::Relaxed);
     } else {
-        s.spawn(move |s| spawn_tree(s, depth - 1, leaves));
+        s.spawn_scoped(move |s| spawn_tree(s, depth - 1, leaves));
         spawn_tree(s, depth - 1, leaves);
     }
 }
