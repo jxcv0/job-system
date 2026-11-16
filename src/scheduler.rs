@@ -1,5 +1,5 @@
 use std::{
-    any::Any, cell::RefCell, marker::PhantomData, num::NonZero, panic::{AssertUnwindSafe, catch_unwind, resume_unwind}, range::Range, sync::{Arc, Mutex}, thread::{JoinHandle, available_parallelism},
+    any::Any, cell::RefCell, marker::PhantomData, num::NonZero, panic::{AssertUnwindSafe, catch_unwind, resume_unwind}, range::Range, sync::{Arc, Mutex, mpsc}, thread::{JoinHandle, available_parallelism},
 };
 
 use crate::{
@@ -11,20 +11,28 @@ use crate::{
 };
 
 thread_local! {
-    static LOCAL: RefCell<Option<Owner>> = const { RefCell::new(None) };
+    /// This is the local queue that the thread owns
+    static LOCAL_OWNER: RefCell<Option<Owner>> = const { RefCell::new(None) };
+    /// This is the stealer of the shared queue for unscoped work
+    static LOCAL_SHARED: RefCell<Option<Stealer>> = const { RefCell::new(None) };
 }
 
 /// Set the owner in TLS
-fn set_worker_tls(owner: Owner) {
-    LOCAL.with(move |l| {
+fn set_worker_tls(owner: Owner, shared_stealer: Stealer) {
+    LOCAL_OWNER.with(move |l| {
         assert!(l.borrow().is_none(), "This thread already has a scheduler");
         *l.borrow_mut() = Some(owner)
+    });
+
+    LOCAL_SHARED.with(move |l| {
+        assert!(l.borrow().is_none(), "This thread already has a scheduler");
+        *l.borrow_mut() = Some(shared_stealer)
     });
 }
 
 /// Get the next work item from the owner in TLS
 fn next_work_item() -> Option<WorkItem> {
-    LOCAL.with(|l| l.borrow().as_ref().unwrap().pop())
+    LOCAL_OWNER.with(|l| l.borrow().as_ref().unwrap().pop())
 }
 
 /// Steal some work from another thread
@@ -35,11 +43,12 @@ fn steal_work_item(stealers: &[Stealer]) -> Option<WorkItem> {
 fn worker_loop(
     owner: Owner,
     stealers: Arc<[Stealer]>,
+    shared_stealer: Stealer,
     arena: Arc<ScopeArena>,
     stop_flag: Arc<AtomicBool>,
 ) {
     // Store local worker data
-    set_worker_tls(owner);
+    set_worker_tls(owner, shared_stealer);
 
     while !stop_flag.load(Ordering::Relaxed) {
         if !try_one_run(&arena, &stealers) {
@@ -77,8 +86,6 @@ fn run_work_item(item: WorkItem, arena: &ScopeArena) {
 pub struct Scope<'s, 'env: 's> {
     /// The bump arena used for allocating jobs in the scope and its nested child scopes
     arena: &'s ScopeArena,
-    /// Storage for unscoped and IO tasks
-    unscoped_slab: Mutex<UnscopedSlab>,
     /// Counts up on spawning of new tasks and down to track the progress of the scope, work is complete when pending == 0
     pending: AtomicU32,
     /// Somewhere to store errors we get while executing jobs in the scope
@@ -93,7 +100,6 @@ impl<'s, 'env> Scope<'s, 'env> {
     fn new(arena: &'s ScopeArena) -> Self {
         Self {
             arena,
-            unscoped_slab: Mutex::new(UnscopedSlab::new()),
             pending: AtomicU32::new(0),
             panic: Default::default(),
             _invariant: Default::default(),
@@ -122,7 +128,7 @@ impl<'s, 'env> Scope<'s, 'env> {
                 // Only increment pending if we managed to allocate the slot
                 self.pending.fetch_add(1, Ordering::Relaxed);
                 let item = WorkItem::new().with_slot(slot).with_kind(JobKind::Scoped);
-                LOCAL.with(|l| {
+                LOCAL_OWNER.with(|l| {
                     l.borrow()
                         .as_ref()
                         .expect("spawn called off a worker")
@@ -133,19 +139,6 @@ impl<'s, 'env> Scope<'s, 'env> {
         }
     }
 
-    /// Allocate a work item for an unscoped task and push to the queue
-    pub fn spawn_unscoped<F>(&'s self, f: F)
-    where
-        F: FnOnce(&'s Scope<'s, 'env>) + Send + 's,
-    {
-        let item = WorkItem::new().with_kind(JobKind::Scoped);
-        LOCAL.with(|l| {
-            l.borrow()
-                .as_ref()
-                .expect("spawn called off a worker")
-                .push(item)
-        })
-    }
 }
 
 // Exclude a workers own stealer from the set of stealers it has access to
@@ -158,6 +151,10 @@ fn stealers_for_worker(stealers: &[Stealer], index: usize) -> Arc<[Stealer]> {
 pub struct Scheduler {
     threads: Vec<JoinHandle<()>>,
     stealers: Arc<[Stealer]>,
+    /// shared owner for enqueing unscoped work
+    shared_owner: Owner,
+    /// Storage for unscoped and IO tasks
+    unscoped_slab: Mutex<UnscopedSlab>,
     arena: Arc<ScopeArena>,
     stop_flag: Arc<AtomicBool>,
     // Only one thread may own the Scheduler
@@ -171,9 +168,11 @@ impl Scheduler {
         let mut owners = owners.into_iter().enumerate();
         let stealers: Arc<[_]> = stealers.into();
 
+        let (shared_owner, shared_stealer) = queue::channel();
+
         // store the main thread's worker info
         let (main_index, main_owner) = owners.next().unwrap();
-        set_worker_tls(main_owner);
+        set_worker_tls(main_owner, shared_stealer.clone());
 
         // FIXME: Work out how to size this
         let arena = Arc::new(ScopeArena::new(4096));
@@ -183,9 +182,10 @@ impl Scheduler {
         let threads = owners
             .map(|(index, owner)| {
                 let stealers = stealers_for_worker(&stealers, index);
+                let shared_stealer = shared_stealer.clone();
                 let arena = arena.clone();
                 let stop_flag = stop_flag.clone();
-                std::thread::spawn(move || worker_loop(owner, stealers, arena, stop_flag))
+                std::thread::spawn(move || worker_loop(owner, stealers, shared_stealer, arena, stop_flag))
             })
             .collect();
 
@@ -194,6 +194,8 @@ impl Scheduler {
         Self {
             threads,
             stealers,
+            shared_owner,
+            unscoped_slab: Mutex::new(UnscopedSlab::new()),
             arena,
             stop_flag,
             _not_send: Default::default(),
@@ -231,8 +233,12 @@ impl Scheduler {
     // task
     pub fn unscoped<'env, F>(&'env mut self, f: F)
     where
-        F: for<'s> FnOnce(),
+        F: FnOnce() + Send + 'static,
     {
+        let mut slab = self.unscoped_slab.lock().unwrap();
+        // TODO: Handle this error gracefully, maybe return an error that hints at trying again later
+        let item = slab.allocate(JobKind::Unscoped, f).unwrap();
+        self.shared_owner.push(item);
     }
 
     fn split_range<'s, 'env, F>(
@@ -288,7 +294,8 @@ impl Drop for Scheduler {
                 panic.get_or_insert(e);
             }
         }
-        LOCAL.with(|l| *l.borrow_mut() = None);
+        LOCAL_OWNER.with(|l| *l.borrow_mut() = None);
+        LOCAL_SHARED.with(|l| *l.borrow_mut() = None);
 
         if let Some(e) = panic
             && !std::thread::panicking()
