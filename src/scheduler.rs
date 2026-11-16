@@ -397,6 +397,10 @@ mod tests {
         }
     }
 
+    // How much longer the tests' deadlines are under Miri, which interprets every step and so runs
+    // far slower than native code
+    const SLOWDOWN: u64 = if cfg!(miri) { 60 } else { 1 };
+
     // Turns a panic payload into its message
     fn payload_message(payload: Box<dyn Any + Send>) -> String {
         match payload.downcast::<&str>() {
@@ -417,7 +421,7 @@ mod tests {
             let payload = catch_unwind(AssertUnwindSafe(|| f(&mut scheduler))).err();
             tx.send(payload.map(payload_message)).unwrap();
         });
-        rx.recv_timeout(Duration::from_secs(5))
+        rx.recv_timeout(Duration::from_secs(5 * SLOWDOWN))
             .expect("scope did not return")
     }
 
@@ -431,7 +435,7 @@ mod tests {
             let payload = catch_unwind(AssertUnwindSafe(|| f(&mut Scheduler::new()))).err();
             tx.send(payload.map(payload_message)).unwrap();
         });
-        rx.recv_timeout(Duration::from_secs(5))
+        rx.recv_timeout(Duration::from_secs(5 * SLOWDOWN))
             .expect("scheduler was not dropped")
     }
 
@@ -542,7 +546,7 @@ mod tests {
                         ran.fetch_add(1, Ordering::Relaxed);
                     });
                     // Give up in the end, so a main thread that never steals fails rather than hangs
-                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let deadline = Instant::now() + Duration::from_secs(2 * SLOWDOWN);
                     spin_until(|| {
                         ran.load(Ordering::Relaxed) == workers || Instant::now() > deadline
                     });
@@ -569,6 +573,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "spawns 10,000 jobs, too slow under Miri")]
     fn consecutive_scopes_can_spawn_more_jobs_in_total_than_the_arena_holds() {
         let ran = Arc::new(AtomicUsize::new(0));
         let counted = ran.clone();
@@ -589,6 +594,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "spawns thousands of jobs, too slow under Miri")]
     fn spawning_past_the_end_of_the_arena_reaches_the_caller() {
         let message = panic_message(|scheduler| {
             scheduler.scope(|s| {
@@ -650,7 +656,7 @@ mod tests {
         assert_eq!(message.as_deref(), Some("boom"));
     }
 
-    const WAIT: Duration = Duration::from_secs(2);
+    const WAIT: Duration = Duration::from_secs(2 * SLOWDOWN);
 
     // Spins until `done`, failing rather than hanging if it takes too long
     fn wait_for(what: &str, done: impl Fn() -> bool) {
