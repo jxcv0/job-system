@@ -1,5 +1,12 @@
 use std::{
-    any::Any, cell::RefCell, marker::PhantomData, num::NonZero, panic::{AssertUnwindSafe, catch_unwind, resume_unwind}, range::Range, sync::{Arc, Mutex, mpsc}, thread::{JoinHandle, available_parallelism},
+    any::Any,
+    cell::RefCell,
+    marker::PhantomData,
+    num::NonZero,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    range::Range,
+    sync::{Arc, Mutex},
+    thread::{JoinHandle, available_parallelism},
 };
 
 use crate::{
@@ -13,20 +20,13 @@ use crate::{
 thread_local! {
     /// This is the local queue that the thread owns
     static LOCAL_OWNER: RefCell<Option<Owner>> = const { RefCell::new(None) };
-    /// This is the stealer of the shared queue for unscoped work
-    static LOCAL_SHARED: RefCell<Option<Stealer>> = const { RefCell::new(None) };
 }
 
 /// Set the owner in TLS
-fn set_worker_tls(owner: Owner, shared_stealer: Stealer) {
+fn set_worker_tls(owner: Owner) {
     LOCAL_OWNER.with(move |l| {
         assert!(l.borrow().is_none(), "This thread already has a scheduler");
         *l.borrow_mut() = Some(owner)
-    });
-
-    LOCAL_SHARED.with(move |l| {
-        assert!(l.borrow().is_none(), "This thread already has a scheduler");
-        *l.borrow_mut() = Some(shared_stealer)
     });
 }
 
@@ -45,14 +45,19 @@ fn worker_loop(
     stealers: Arc<[Stealer]>,
     shared_stealer: Stealer,
     arena: Arc<ScopeArena>,
+    unscoped_slab: Arc<Mutex<UnscopedSlab>>,
     stop_flag: Arc<AtomicBool>,
 ) {
     // Store local worker data
-    set_worker_tls(owner, shared_stealer);
+    set_worker_tls(owner);
 
     while !stop_flag.load(Ordering::Relaxed) {
-        if !try_one_run(&arena, &stealers) {
-            std::thread::yield_now();
+        if try_scoped_run(&arena, &stealers) {
+            continue;
+        }
+
+        if try_unscoped_run(&unscoped_slab, &shared_stealer) {
+            continue;
         }
     }
 }
@@ -60,7 +65,7 @@ fn worker_loop(
 // Get the next work item from TLS owner or from a [Stealer] and then run it
 // Returns true if it found a job to run otherwise false, this is used to work out if the thread
 // should yield
-fn try_one_run(arena: &ScopeArena, stealers: &[Stealer]) -> bool {
+fn try_scoped_run(arena: &ScopeArena, stealers: &[Stealer]) -> bool {
     if let Some(item) = next_work_item() {
         run_work_item(item, arena);
         return true;
@@ -70,6 +75,10 @@ fn try_one_run(arena: &ScopeArena, stealers: &[Stealer]) -> bool {
         return true;
     }
     false
+}
+
+fn try_unscoped_run(unscoped_slab: &Arc<Mutex<UnscopedSlab>>, shared_stealer: &Stealer) -> bool {
+    todo!()
 }
 
 // Run a work item
@@ -138,7 +147,6 @@ impl<'s, 'env> Scope<'s, 'env> {
             Err(_) => panic!("arena out of memory"),
         }
     }
-
 }
 
 // Exclude a workers own stealer from the set of stealers it has access to
@@ -154,7 +162,7 @@ pub struct Scheduler {
     /// shared owner for enqueing unscoped work
     shared_owner: Owner,
     /// Storage for unscoped and IO tasks
-    unscoped_slab: Mutex<UnscopedSlab>,
+    unscoped_slab: Arc<Mutex<UnscopedSlab>>,
     arena: Arc<ScopeArena>,
     stop_flag: Arc<AtomicBool>,
     // Only one thread may own the Scheduler
@@ -172,10 +180,11 @@ impl Scheduler {
 
         // store the main thread's worker info
         let (main_index, main_owner) = owners.next().unwrap();
-        set_worker_tls(main_owner, shared_stealer.clone());
+        set_worker_tls(main_owner);
 
         // FIXME: Work out how to size this
         let arena = Arc::new(ScopeArena::new(4096));
+        let unscoped_slab = Arc::new(Mutex::new(UnscopedSlab::new()));
         let stop_flag = Arc::new(AtomicBool::new(false));
 
         // Spawn the threads
@@ -184,8 +193,11 @@ impl Scheduler {
                 let stealers = stealers_for_worker(&stealers, index);
                 let shared_stealer = shared_stealer.clone();
                 let arena = arena.clone();
+                let slab = unscoped_slab.clone();
                 let stop_flag = stop_flag.clone();
-                std::thread::spawn(move || worker_loop(owner, stealers, shared_stealer, arena, stop_flag))
+                std::thread::spawn(move || {
+                    worker_loop(owner, stealers, shared_stealer, arena, slab, stop_flag)
+                })
             })
             .collect();
 
@@ -195,7 +207,7 @@ impl Scheduler {
             threads,
             stealers,
             shared_owner,
-            unscoped_slab: Mutex::new(UnscopedSlab::new()),
+            unscoped_slab,
             arena,
             stop_flag,
             _not_send: Default::default(),
@@ -211,7 +223,7 @@ impl Scheduler {
         let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
 
         while scope.pending.load(Ordering::Acquire) > 0 {
-            try_one_run(&self.arena, &self.stealers);
+            try_scoped_run(&self.arena, &self.stealers);
             std::thread::yield_now();
         }
 
@@ -296,7 +308,6 @@ impl Drop for Scheduler {
             }
         }
         LOCAL_OWNER.with(|l| *l.borrow_mut() = None);
-        LOCAL_SHARED.with(|l| *l.borrow_mut() = None);
 
         if let Some(e) = panic
             && !std::thread::panicking()
@@ -642,7 +653,11 @@ mod tests {
                 .unscoped(move || tx.send(thread::current().id()).unwrap())
                 .unwrap();
             let ran_on = rx.recv_timeout(WAIT).expect("unscoped task never ran");
-            assert_ne!(ran_on, thread::current().id(), "ran on the scheduler's thread");
+            assert_ne!(
+                ran_on,
+                thread::current().id(),
+                "ran on the scheduler's thread"
+            );
         });
         assert_eq!(message, None);
     }
@@ -686,7 +701,9 @@ mod tests {
                     task_finished.store(true, Ordering::Relaxed);
                 })
                 .unwrap();
-            wait_for("the unscoped task to start", || started.load(Ordering::Relaxed));
+            wait_for("the unscoped task to start", || {
+                started.load(Ordering::Relaxed)
+            });
         });
         assert_eq!(message, None);
         assert!(
