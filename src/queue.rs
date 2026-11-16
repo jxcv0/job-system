@@ -5,22 +5,12 @@ use crate::{
     sync::{Arc, AtomicIsize, AtomicU32, Ordering, fence},
 };
 
-use crate::CACHE_LINE;
-
-#[repr(align(128))]
-struct CacheAligned<T>(T);
-impl<T> Deref for CacheAligned<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-// This is so we don't forget to change the align of [CacheAligned] in case we change the constant [CACHE_LINE]
-const _: () = assert!(align_of::<CacheAligned<u8>>() == CACHE_LINE);
+use crate::CacheAligned;
 
 /// The maximum number of tasks that can be enqueued in a [WorkQueue]
 #[cfg(not(loom))]
 const MAX_TASKS_PER_WORKER: usize = 4096;
+
 // loom tracks every atomic it models, so keep the buffer tiny under it.
 #[cfg(loom)]
 const MAX_TASKS_PER_WORKER: usize = 4;

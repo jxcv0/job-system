@@ -1,21 +1,17 @@
 use std::{
-    any::Any,
-    cell::RefCell,
-    marker::PhantomData,
-    num::NonZero,
-    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-    range::Range,
-    sync::{Arc, Mutex},
-    thread::{JoinHandle, available_parallelism},
+    any::Any, cell::RefCell, marker::PhantomData, num::NonZero, panic::{AssertUnwindSafe, catch_unwind, resume_unwind}, range::Range, sync::{Arc, Mutex, atomic::AtomicUsize}, thread::{JoinHandle, available_parallelism},
 };
 
 use crate::{
+    CacheAligned,
     arena::ScopeArena,
     jobs::{JobKind, WorkItem},
     queue::{self, Owner, Stealer},
     sync::{AtomicBool, AtomicU32, Ordering},
     unscoped_slab::{UnscopedSlab, UnscopedSlabError},
 };
+
+const MAX_UNSCOPED_IN_FLIGHT: usize = 4;
 
 thread_local! {
     /// This is the local queue that the thread owns
@@ -40,25 +36,42 @@ fn steal_work_item(stealers: &[Stealer]) -> Option<WorkItem> {
     stealers.iter().find_map(Stealer::steal)
 }
 
+struct Shared {
+    arena: ScopeArena,
+    stop_flag: CacheAligned<AtomicBool>,
+    unscoped: Unscoped,
+}
+
+struct Unscoped {
+    /// The slab where unscoped work is stored
+    slab: Mutex<UnscopedSlab>,
+    /// The number of unscoped work items currently in flight
+    in_flight: CacheAligned<AtomicUsize>,
+    /// The number of unscoped work items waiting to be run
+    pending: CacheAligned<AtomicUsize>,
+    /// Storage for panics during unscoped work
+    panic: Mutex<Option<Box<dyn Any + Send>>>,
+}
+
 fn worker_loop(
     owner: Owner,
     stealers: Arc<[Stealer]>,
     shared_stealer: Stealer,
-    arena: Arc<ScopeArena>,
-    unscoped_slab: Arc<Mutex<UnscopedSlab>>,
-    stop_flag: Arc<AtomicBool>,
+    shared: Arc<Shared>,
 ) {
     // Store local worker data
     set_worker_tls(owner);
 
-    while !stop_flag.load(Ordering::Relaxed) {
-        if try_scoped_run(&arena, &stealers) {
+    while !shared.stop_flag.load(Ordering::Relaxed) {
+        if try_scoped_run(&shared.arena, &stealers) {
             continue;
         }
 
-        if try_unscoped_run(&unscoped_slab, &shared_stealer) {
+        if try_unscoped_run(&shared.unscoped.slab, &shared_stealer) {
             continue;
         }
+
+        std::thread::yield_now();
     }
 }
 
@@ -77,8 +90,8 @@ fn try_scoped_run(arena: &ScopeArena, stealers: &[Stealer]) -> bool {
     false
 }
 
-fn try_unscoped_run(unscoped_slab: &Arc<Mutex<UnscopedSlab>>, shared_stealer: &Stealer) -> bool {
-    todo!()
+fn try_unscoped_run(unscoped_slab: &Mutex<UnscopedSlab>, shared_stealer: &Stealer) -> bool {
+    false
 }
 
 // Run a work item
@@ -161,10 +174,7 @@ pub struct Scheduler {
     stealers: Arc<[Stealer]>,
     /// shared owner for enqueing unscoped work
     shared_owner: Owner,
-    /// Storage for unscoped and IO tasks
-    unscoped_slab: Arc<Mutex<UnscopedSlab>>,
-    arena: Arc<ScopeArena>,
-    stop_flag: Arc<AtomicBool>,
+    shared: Arc<Shared>,
     // Only one thread may own the Scheduler
     _not_send: PhantomData<*const ()>,
 }
@@ -182,21 +192,28 @@ impl Scheduler {
         let (main_index, main_owner) = owners.next().unwrap();
         set_worker_tls(main_owner);
 
-        // FIXME: Work out how to size this
-        let arena = Arc::new(ScopeArena::new(4096));
-        let unscoped_slab = Arc::new(Mutex::new(UnscopedSlab::new()));
-        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let shared = Arc::new(Shared {
+            // FIXME: Work out how to size this arena
+            arena: ScopeArena::new(4096),
+            stop_flag: CacheAligned::new(AtomicBool::new(false)),
+            unscoped: Unscoped {
+                slab: Mutex::new(UnscopedSlab::new()),
+                in_flight: CacheAligned::new(AtomicUsize::new(0)),
+                pending: CacheAligned::new(AtomicUsize::new(0)),
+                panic: Mutex::new(None),
+            },
+        });
 
         // Spawn the threads
         let threads = owners
             .map(|(index, owner)| {
+                let shared = shared.clone();
                 let stealers = stealers_for_worker(&stealers, index);
                 let shared_stealer = shared_stealer.clone();
-                let arena = arena.clone();
-                let slab = unscoped_slab.clone();
-                let stop_flag = stop_flag.clone();
+
                 std::thread::spawn(move || {
-                    worker_loop(owner, stealers, shared_stealer, arena, slab, stop_flag)
+                    worker_loop(owner, stealers, shared_stealer, shared);
                 })
             })
             .collect();
@@ -207,9 +224,7 @@ impl Scheduler {
             threads,
             stealers,
             shared_owner,
-            unscoped_slab,
-            arena,
-            stop_flag,
+            shared,
             _not_send: Default::default(),
         }
     }
@@ -219,11 +234,11 @@ impl Scheduler {
     where
         F: for<'s> FnOnce(&'s Scope<'s, 'env>),
     {
-        let scope = Scope::new(&self.arena);
+        let scope = Scope::new(&self.shared.arena);
         let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
 
         while scope.pending.load(Ordering::Acquire) > 0 {
-            try_scoped_run(&self.arena, &self.stealers);
+            try_scoped_run(&self.shared.arena, &self.stealers);
             std::thread::yield_now();
         }
 
@@ -248,7 +263,7 @@ impl Scheduler {
     where
         F: FnOnce() + Send + 'static,
     {
-        let mut slab = self.unscoped_slab.lock().unwrap();
+        let mut slab = self.shared.unscoped.slab.lock().unwrap();
         let item = slab.allocate(JobKind::Unscoped, f)?;
         self.shared_owner.push(item);
         Ok(())
@@ -299,7 +314,7 @@ impl Default for Scheduler {
 }
 impl Drop for Scheduler {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
+        self.shared.stop_flag.store(true, Ordering::Relaxed);
         let mut panic = None;
 
         for t in self.threads.drain(..) {
@@ -826,7 +841,7 @@ mod tests {
     fn drop_waits_for_every_worker_to_exit() {
         let scheduler = Scheduler::new();
         // Each worker holds a clone of the arena until it exits
-        let arena = Arc::downgrade(&scheduler.arena);
+        let arena = Arc::downgrade(&scheduler.shared);
         drop(scheduler);
         assert!(arena.upgrade().is_none());
     }
