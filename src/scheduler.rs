@@ -442,7 +442,7 @@ mod tests {
     fn panic_in_a_job_reaches_the_caller() {
         let message = panic_message(|scheduler| {
             // If every worker is holding a slot, free one to steal the scoped job
-            let free_a_worker = scheduler.threads.len() <= MAX_UNSCOPED_IN_FLIGHT;
+            let _free_a_worker = scheduler.threads.len() <= MAX_UNSCOPED_IN_FLIGHT;
             let started = AtomicBool::new(false);
             scheduler.scope(|s| {
                 s.spawn_scoped(|_| {
@@ -462,7 +462,7 @@ mod tests {
         let job_finished = finished.clone();
         let message = panic_message(move |scheduler| {
             // If every worker is holding a slot, free one to steal the scoped job
-            let free_a_worker = scheduler.threads.len() <= MAX_UNSCOPED_IN_FLIGHT;
+            let _free_a_worker = scheduler.threads.len() <= MAX_UNSCOPED_IN_FLIGHT;
             let started = AtomicBool::new(false);
             scheduler.scope(|s| {
                 s.spawn_scoped(|_| {
