@@ -1,4 +1,6 @@
-use crate::{jobs::{JobKind, WorkItem,}, sync::Mutex};
+use std::sync::Mutex;
+
+use crate::jobs::{JobKind, WorkItem};
 
 const MAX_SLOTS: usize = 64;
 

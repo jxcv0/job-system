@@ -5,6 +5,10 @@ use std::{
     num::NonZero,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     range::Range,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    },
     thread::{JoinHandle, available_parallelism},
 };
 
@@ -13,7 +17,6 @@ use crate::{
     arena::ScopeArena,
     jobs::{JobKind, WorkItem},
     queue::{self, Owner, Stealer},
-    sync::{Arc, AtomicBool, AtomicU32, AtomicUsize, Mutex, Ordering},
     unscoped_slab::{UnscopedSlab, UnscopedSlabError},
 };
 
@@ -375,7 +378,7 @@ impl Drop for Scheduler {
     }
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::{

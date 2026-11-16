@@ -17,12 +17,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
 
-  loom:
+  miri:
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: --cfg loom
+      # Miri reports one CPU by default, which would leave the scheduler with no workers
+      MIRIFLAGS: -Zmiri-num-cpus=4
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --release --lib loom
+      - run: cargo miri setup
+      - run: cargo miri test --lib

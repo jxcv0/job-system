@@ -1,19 +1,16 @@
-use std::{cell::Cell, marker::PhantomData};
-
-use crate::{
-    jobs::WorkItem,
-    sync::{Arc, AtomicIsize, AtomicU32, Ordering, fence},
+use std::{
+    cell::Cell,
+    marker::PhantomData,
+    sync::{
+        Arc,
+        atomic::{AtomicIsize, AtomicU32, Ordering, fence},
+    },
 };
 
-use crate::CacheAligned;
+use crate::{CacheAligned, jobs::WorkItem};
 
 /// The maximum number of tasks that can be enqueued in a [WorkQueue]
-#[cfg(not(loom))]
 const MAX_TASKS_PER_WORKER: usize = 4096;
-
-// loom tracks every atomic it models, so keep the buffer tiny under it.
-#[cfg(loom)]
-const MAX_TASKS_PER_WORKER: usize = 4;
 const _: () = assert!(MAX_TASKS_PER_WORKER.is_power_of_two());
 
 fn mask(index: usize) -> usize {
@@ -139,78 +136,7 @@ impl Stealer {
     }
 }
 
-#[cfg(all(test, loom))]
-mod loom_tests {
-    use super::*;
-    use loom::thread;
-
-    fn steal_all(stealer: &Stealer) -> Vec<u32> {
-        std::iter::from_fn(|| stealer.steal().map(WorkItem::into_bits)).collect()
-    }
-
-    fn assert_each_once(mut seen: Vec<u32>, expected: impl IntoIterator<Item = u32>) {
-        seen.sort_unstable();
-        assert_eq!(seen, expected.into_iter().collect::<Vec<_>>());
-    }
-
-    // The owner and a thief race for the only item: exactly one of them gets it.
-    #[test]
-    fn loom_pop_and_steal_race_for_the_last_item() {
-        loom::model(|| {
-            let (owner, stealer) = channel();
-            owner.push(WorkItem::from_bits(7));
-
-            let thief = thread::spawn(move || stealer.steal().map(WorkItem::into_bits));
-            let popped = owner.pop().map(WorkItem::into_bits);
-            let stolen = thief.join().unwrap();
-
-            assert_each_once(popped.into_iter().chain(stolen).collect(), [7]);
-        });
-    }
-
-    // A thief steals while the owner is still pushing, then the owner drains the rest.
-    #[test]
-    fn loom_steal_during_push_delivers_each_item_once() {
-        loom::model(|| {
-            let (owner, stealer) = channel();
-
-            let thief = thread::spawn(move || steal_all(&stealer));
-            owner.push(WorkItem::from_bits(0));
-            owner.push(WorkItem::from_bits(1));
-            let mut seen: Vec<u32> =
-                std::iter::from_fn(|| owner.pop().map(WorkItem::into_bits)).collect();
-            seen.extend(thief.join().unwrap());
-
-            assert_each_once(seen, 0..2);
-        });
-    }
-
-    // Two thieves and the owner all compete for two items.
-    #[test]
-    fn loom_two_thieves_and_owner_deliver_each_item_once() {
-        loom::model(|| {
-            let (owner, stealer) = channel();
-            owner.push(WorkItem::from_bits(0));
-            owner.push(WorkItem::from_bits(1));
-
-            let thieves: Vec<_> = (0..2)
-                .map(|_| {
-                    let stealer = stealer.clone();
-                    thread::spawn(move || stealer.steal().map(WorkItem::into_bits))
-                })
-                .collect();
-            let mut seen: Vec<u32> = owner.pop().map(WorkItem::into_bits).into_iter().collect();
-            for thief in thieves {
-                seen.extend(thief.join().unwrap());
-            }
-            seen.extend(std::iter::from_fn(|| owner.pop().map(WorkItem::into_bits)));
-
-            assert_each_once(seen, 0..2);
-        });
-    }
-}
-
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -274,12 +200,77 @@ mod tests {
         }
     }
 
+    fn assert_each_once(mut seen: Vec<u32>, expected: impl IntoIterator<Item = u32>) {
+        seen.sort_unstable();
+        assert_eq!(seen, expected.into_iter().collect::<Vec<_>>());
+    }
+
+    // The races below only fail on some interleavings, so each is repeated. Miri is far slower,
+    // and is run with several seeds instead to vary its scheduling
+    const RACE_RUNS: usize = if cfg!(miri) { 4 } else { 1000 };
+
+    // The owner and a thief race for the only item: exactly one of them gets it
+    #[test]
+    fn pop_and_steal_race_for_the_last_item() {
+        for _ in 0..RACE_RUNS {
+            let (owner, stealer) = channel();
+            owner.push(WorkItem::from_bits(7));
+
+            let thief = std::thread::spawn(move || stealer.steal().map(WorkItem::into_bits));
+            let popped = owner.pop().map(WorkItem::into_bits);
+            let stolen = thief.join().unwrap();
+
+            assert_each_once(popped.into_iter().chain(stolen).collect(), [7]);
+        }
+    }
+
+    // A thief steals while the owner is still pushing, then the owner drains the rest
+    #[test]
+    fn steal_during_push_delivers_each_item_once() {
+        for _ in 0..RACE_RUNS {
+            let (owner, stealer) = channel();
+
+            let thief = std::thread::spawn(move || steal_all(&stealer));
+            owner.push(WorkItem::from_bits(0));
+            owner.push(WorkItem::from_bits(1));
+            let mut seen = pop_all(&owner);
+            seen.extend(thief.join().unwrap());
+
+            assert_each_once(seen, 0..2);
+        }
+    }
+
+    // Two thieves and the owner all compete for two items
+    #[test]
+    fn two_thieves_and_owner_deliver_each_item_once() {
+        for _ in 0..RACE_RUNS {
+            let (owner, stealer) = channel();
+            owner.push(WorkItem::from_bits(0));
+            owner.push(WorkItem::from_bits(1));
+
+            let thieves: Vec<_> = (0..2)
+                .map(|_| {
+                    let stealer = stealer.clone();
+                    std::thread::spawn(move || stealer.steal().map(WorkItem::into_bits))
+                })
+                .collect();
+            let mut seen: Vec<u32> = owner.pop().map(WorkItem::into_bits).into_iter().collect();
+            for thief in thieves {
+                seen.extend(thief.join().unwrap());
+            }
+            seen.extend(pop_all(&owner));
+
+            assert_each_once(seen, 0..2);
+        }
+    }
+
     // The owner pushes in batches no larger than the capacity and drains each batch itself, while
     // thieves steal concurrently. Every item must come out exactly once.
     #[test]
     fn concurrent_pop_and_steal_deliver_each_item_once() {
-        const BATCH: u32 = 1024;
-        const TOTAL: u32 = 200 * BATCH;
+        // Miri interprets every step, so it gets far fewer items
+        const BATCH: u32 = if cfg!(miri) { 16 } else { 1024 };
+        const TOTAL: u32 = if cfg!(miri) { 4 } else { 200 } * BATCH;
         const THIEVES: usize = 4;
 
         let (owner, stealer) = channel();

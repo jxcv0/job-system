@@ -1,9 +1,12 @@
-use std::mem::MaybeUninit;
+use std::{
+    cell::UnsafeCell,
+    mem::MaybeUninit,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use crate::{
     CACHE_LINE,
     jobs::{JobHeader, MAX_SLOTS},
-    sync::{AtomicU32, Ordering, UnsafeCell},
 };
 
 pub(crate) const fn closure_offset<F>() -> usize {
@@ -17,8 +20,6 @@ const fn lines_for<F>() -> u32 {
 #[repr(align(128))]
 #[allow(dead_code)]
 struct Line(UnsafeCell<MaybeUninit<[u8; CACHE_LINE]>>);
-// loom's UnsafeCell carries tracking state, so only the real cell is exactly one line
-#[cfg(not(loom))]
 const _: () = assert!(size_of::<Line>() == CACHE_LINE);
 
 /// A bump allocator for use by a scope to allocate tasks to
@@ -35,17 +36,9 @@ pub(crate) enum ScopeArenaError {
 impl ScopeArena {
     pub(crate) fn new(capacity: u32) -> Self {
         assert!(capacity <= MAX_SLOTS, "capacity exceeds WorkItem slot bits");
-        #[cfg(not(loom))]
-        let lines = {
-            let lines = Box::new_uninit_slice(capacity as usize);
-            // SAFETY: a Line is only MaybeUninit bytes, so uninitialised memory is a valid Line
-            unsafe { lines.assume_init() }
-        };
-        // loom's UnsafeCell has tracking state that must be constructed, not left uninitialised
-        #[cfg(loom)]
-        let lines = (0..capacity)
-            .map(|_| Line(UnsafeCell::new(MaybeUninit::uninit())))
-            .collect();
+        let lines = Box::new_uninit_slice(capacity as usize);
+        // SAFETY: a Line is only MaybeUninit bytes, so uninitialised memory is a valid Line
+        let lines = unsafe { lines.assume_init() };
         Self {
             lines,
             cursor: AtomicU32::new(0),
@@ -78,13 +71,6 @@ impl ScopeArena {
     }
 
     /// Calls `f` with a pointer to the first byte of line `index`
-    #[cfg(loom)]
-    fn with_line_mut<R>(&self, index: u32, f: impl FnOnce(*mut u8) -> R) -> R {
-        self.lines[index as usize].0.with_mut(|p| f(p.cast()))
-    }
-
-    /// Calls `f` with a pointer to the first byte of line `index`
-    #[cfg(not(loom))]
     fn with_line_mut<R>(&self, index: u32, f: impl FnOnce(*mut u8) -> R) -> R {
         assert!((index as usize) < self.lines.len());
         // Derived from the whole slice so a job may run on into the following lines
@@ -115,25 +101,7 @@ impl ScopeArena {
 // SAFETY: alloc hands each line range to exactly one caller, so lines are never written concurrently
 unsafe impl Sync for ScopeArena {}
 
-#[cfg(all(test, loom))]
-mod loom_tests {
-    use super::*;
-    use loom::{sync::Arc, thread};
-
-    #[test]
-    #[should_panic(expected = "Causality violation")]
-    fn loom_sees_unsynchronised_writes_to_a_line() {
-        loom::model(|| {
-            let arena = Arc::new(ScopeArena::new(1));
-            let other = arena.clone();
-            let writer = thread::spawn(move || other.with_line_mut(0, |p| unsafe { p.write(1) }));
-            arena.with_line_mut(0, |p| unsafe { p.write(2) });
-            writer.join().unwrap();
-        });
-    }
-}
-
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

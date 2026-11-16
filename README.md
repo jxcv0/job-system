@@ -58,14 +58,16 @@ Unscoped jobs come first, then the others.
 cargo test
 ```
 
-The queue is also model-checked with [loom](https://github.com/tokio-rs/loom). Under
-`cfg(loom)`, `src/sync.rs` swaps in loom's atomics and the deque shrinks to 4 slots:
+The tests also run under [Miri](https://github.com/rust-lang/miri), which reports data races
+and undefined behaviour, such as in the arena's `unsafe` code. Miri reports a single CPU by
+default, which would leave the scheduler with no workers, so give it more:
 
 ```bash
-RUSTFLAGS="--cfg loom" cargo test --release --lib loom
+MIRIFLAGS="-Zmiri-num-cpus=4" cargo +nightly miri test --lib
 ```
 
-CI runs both on every push to `main` and on pull requests.
+Tests that race threads repeat themselves, and scale down under `cfg(miri)` because Miri is far
+slower. CI runs both on every push to `main` and on pull requests.
 
 ## Benchmarks
 
