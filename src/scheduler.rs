@@ -5,7 +5,6 @@ use std::{
     num::NonZero,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     range::Range,
-    sync::{Arc, Mutex},
     thread::{JoinHandle, available_parallelism},
 };
 
@@ -14,7 +13,7 @@ use crate::{
     arena::ScopeArena,
     jobs::{JobKind, WorkItem},
     queue::{self, Owner, Stealer},
-    sync::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    sync::{Arc, AtomicBool, AtomicU32, AtomicUsize, Mutex, Ordering},
     unscoped_slab::{UnscopedSlab, UnscopedSlabError},
 };
 
@@ -51,7 +50,7 @@ struct Shared {
 
 struct Unscoped {
     /// The slab where unscoped work is stored
-    slab: Mutex<UnscopedSlab>,
+    slab: UnscopedSlab,
     /// The number of unscoped work items currently in flight
     in_flight: CacheAligned<AtomicUsize>,
     /// The number of unscoped work items waiting to be run
@@ -98,24 +97,27 @@ fn try_scoped_run(arena: &ScopeArena, stealers: &[Stealer]) -> bool {
 }
 
 fn try_unscoped_run(unscoped: &Unscoped, shared_stealer: &Stealer) -> bool {
-    unscoped
+    if unscoped
         .in_flight
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
             (n < MAX_UNSCOPED_IN_FLIGHT).then_some(n + 1)
         })
-        .unwrap();
+        .is_err()
+    {
+        return false;
+    }
 
     let did_work = match shared_stealer.steal() {
         Some(item) => match item.kind() {
             JobKind::Unscoped => {
-                let mut slab = unscoped.slab.lock().unwrap();
-                match slab.take(item.slot()) {
-                    Some(f) => {
-                        f();
-                        true
-                    }
-                    None => false,
+                let f = unscoped
+                    .slab
+                    .take(item.slot())
+                    .expect("Expected work allocated in slab, pending counter out of sync");
+                if let Err(e) = catch_unwind(AssertUnwindSafe(f)) {
+                    unscoped.panic.lock().unwrap().get_or_insert(e);
                 }
+                true
             }
             _ => unreachable!(),
         },
@@ -123,6 +125,9 @@ fn try_unscoped_run(unscoped: &Unscoped, shared_stealer: &Stealer) -> bool {
     };
 
     unscoped.in_flight.fetch_sub(1, Ordering::Relaxed);
+    if did_work {
+        unscoped.pending.fetch_sub(1, Ordering::Release);
+    }
     did_work
 }
 
@@ -228,7 +233,7 @@ impl Scheduler {
             arena: ScopeArena::new(4096),
             stop_flag: CacheAligned::new(AtomicBool::new(false)),
             unscoped: Unscoped {
-                slab: Mutex::new(UnscopedSlab::new()),
+                slab: UnscopedSlab::new(),
                 in_flight: CacheAligned::new(AtomicUsize::new(0)),
                 pending: CacheAligned::new(AtomicUsize::new(0)),
                 panic: Mutex::new(None),
@@ -293,8 +298,9 @@ impl Scheduler {
     where
         F: FnOnce() + Send + 'static,
     {
-        let mut slab = self.shared.unscoped.slab.lock().unwrap();
-        let item = slab.allocate(JobKind::Unscoped, f)?;
+        let unscoped = &self.shared.unscoped;
+        let item = unscoped.slab.allocate(JobKind::Unscoped, f)?;
+        unscoped.pending.fetch_add(1, Ordering::Relaxed);
         self.shared_owner.push(item);
         Ok(())
     }
@@ -344,8 +350,15 @@ impl Default for Scheduler {
 }
 impl Drop for Scheduler {
     fn drop(&mut self) {
+        // Wait for unscoped tasks to finish
+        // Since only the main thread may push jobs we don't have to worry about more unscoped work
+        // being enqueued before we set the stop flag
+        while self.shared.unscoped.pending.load(Ordering::Acquire) > 0 {
+            std::thread::yield_now();
+        }
+
         self.shared.stop_flag.store(true, Ordering::Relaxed);
-        let mut panic = None;
+        let mut panic = self.shared.unscoped.panic.lock().unwrap().take();
 
         for t in self.threads.drain(..) {
             if let Err(e) = t.join() {

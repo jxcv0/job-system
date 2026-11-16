@@ -1,4 +1,4 @@
-use crate::jobs::{JobKind, WorkItem};
+use crate::{jobs::{JobKind, WorkItem,}, sync::Mutex};
 
 const MAX_SLOTS: usize = 64;
 
@@ -8,29 +8,33 @@ pub enum UnscopedSlabError {
 }
 
 #[derive(Default)]
-pub(crate) struct UnscopedSlab {
+struct Inner {
     slots: Vec<Option<Box<dyn FnOnce() + Send>>>,
     free: Vec<u32>,
 }
 
+#[derive(Default)]
+pub(crate) struct UnscopedSlab {
+    inner: Mutex<Inner>,
+}
+
 impl UnscopedSlab {
     pub(crate) fn new() -> Self {
-        Self {
-            ..Default::default()
-        }
+        Default::default()
     }
 
     // Allocate work in the slab and return the WorkItem so it can be fetched later from a queue
-    pub(crate) fn allocate<F>(&mut self, kind: JobKind, f: F) -> Result<WorkItem, UnscopedSlabError>
+    pub(crate) fn allocate<F>(&self, kind: JobKind, f: F) -> Result<WorkItem, UnscopedSlabError>
     where
         F: FnOnce() + Send + 'static,
     {
-        let slot = if let Some(slot) = self.free.pop() {
-            self.slots[slot as usize] = Some(Box::new(f));
+        let mut slab = self.inner.lock().unwrap();
+        let slot = if let Some(slot) = slab.free.pop() {
+            slab.slots[slot as usize] = Some(Box::new(f));
             slot
-        } else if self.slots.len() < MAX_SLOTS {
-            let slot = self.slots.len() as u32;
-            self.slots.push(Some(Box::new(f)));
+        } else if slab.slots.len() < MAX_SLOTS {
+            let slot = slab.slots.len() as u32;
+            slab.slots.push(Some(Box::new(f)));
             slot
         } else {
             return Err(UnscopedSlabError::MaxSlotsReached);
@@ -40,10 +44,11 @@ impl UnscopedSlab {
     }
 
     // Fetch work from the slab
-    pub(crate) fn take(&mut self, slot: u32) -> Option<Box<dyn FnOnce() + Send>> {
-        let maybe_fun = self.slots[slot as usize].take();
+    pub(crate) fn take(&self, slot: u32) -> Option<Box<dyn FnOnce() + Send>> {
+        let mut slab = self.inner.lock().unwrap();
+        let maybe_fun = slab.slots[slot as usize].take();
         if maybe_fun.is_some() {
-            self.free.push(slot);
+            slab.free.push(slot);
         }
         maybe_fun
     }

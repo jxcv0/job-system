@@ -3,6 +3,7 @@
 #[cfg(loom)]
 pub(crate) use loom::sync::{
     Arc,
+    Mutex,
     atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering, fence},
 };
 
@@ -12,6 +13,7 @@ pub(crate) use loom::cell::UnsafeCell;
 #[cfg(not(loom))]
 pub(crate) use std::sync::{
     Arc,
+    Mutex,
     atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering, fence},
 };
 
