@@ -12,3 +12,4 @@ compile_error!("job-system assumes x86_64 cache geometry");
 pub(crate) const CACHE_LINE: usize = 64 * 2;
 
 pub use scheduler::{Scheduler, Scope};
+pub use unscoped_slab::UnscopedSlabError;

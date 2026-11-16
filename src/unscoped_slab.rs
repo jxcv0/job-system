@@ -3,7 +3,7 @@ use crate::jobs::{JobKind, WorkItem};
 const MAX_SLOTS: usize = 64;
 
 #[derive(Debug)]
-pub(crate) enum UnscopedSlabError {
+pub enum UnscopedSlabError {
     MaxSlotsReached,
 }
 

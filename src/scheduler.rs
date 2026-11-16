@@ -7,7 +7,7 @@ use crate::{
     jobs::{JobKind, WorkItem},
     queue::{self, Owner, Stealer},
     sync::{AtomicBool, AtomicU32, Ordering},
-    unscoped_slab::UnscopedSlab,
+    unscoped_slab::{UnscopedSlab, UnscopedSlabError},
 };
 
 thread_local! {
@@ -231,14 +231,15 @@ impl Scheduler {
     // Set up a task that a thread will pick up and run until it's complete or returns an error
     // This differs from Scheduler::scope in that the scheduler will not track the completion of the
     // task
-    pub fn unscoped<'env, F>(&'env mut self, f: F)
+    // Returns an error if too many unscoped tasks are already queued or running
+    pub fn unscoped<F>(&mut self, f: F) -> Result<(), UnscopedSlabError>
     where
         F: FnOnce() + Send + 'static,
     {
         let mut slab = self.unscoped_slab.lock().unwrap();
-        // TODO: Handle this error gracefully, maybe return an error that hints at trying again later
-        let item = slab.allocate(JobKind::Unscoped, f).unwrap();
+        let item = slab.allocate(JobKind::Unscoped, f)?;
         self.shared_owner.push(item);
+        Ok(())
     }
 
     fn split_range<'s, 'env, F>(
@@ -311,6 +312,7 @@ mod tests {
     use std::{
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
+            Barrier,
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
@@ -324,6 +326,17 @@ mod tests {
         }
     }
 
+    // Turns a panic payload into its message
+    fn payload_message(payload: Box<dyn Any + Send>) -> String {
+        match payload.downcast::<&str>() {
+            Ok(s) => s.to_string(),
+            Err(payload) => match payload.downcast::<String>() {
+                Ok(s) => *s,
+                Err(_) => "<not a string payload>".to_string(),
+            },
+        }
+    }
+
     // Runs `f` against a fresh Scheduler on its own thread and returns the message it panicked
     // with. Gives up after a deadline, so a scope that never returns fails rather than hangs.
     fn panic_message(f: impl FnOnce(&mut Scheduler) + Send + 'static) -> Option<String> {
@@ -331,14 +344,24 @@ mod tests {
         thread::spawn(move || {
             let mut scheduler = Scheduler::new();
             let payload = catch_unwind(AssertUnwindSafe(|| f(&mut scheduler))).err();
-            let message = payload.map(|p| match p.downcast::<&str>() {
-                Ok(s) => s.to_string(),
-                Err(_) => "<not a &str payload>".to_string(),
-            });
-            tx.send(message).unwrap();
+            tx.send(payload.map(payload_message)).unwrap();
         });
         rx.recv_timeout(Duration::from_secs(5))
             .expect("scope did not return")
+    }
+
+    // Like `panic_message`, but the Scheduler is dropped inside the catch, so a panic re-raised
+    // by Drop is returned too
+    fn panic_message_including_drop(
+        f: impl FnOnce(&mut Scheduler) + Send + 'static,
+    ) -> Option<String> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let payload = catch_unwind(AssertUnwindSafe(|| f(&mut Scheduler::new()))).err();
+            tx.send(payload.map(payload_message)).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("scheduler was not dropped")
     }
 
     #[test]
@@ -550,6 +573,229 @@ mod tests {
             });
         });
         assert_eq!(message.as_deref(), Some("boom"));
+    }
+
+    const WAIT: Duration = Duration::from_secs(2);
+
+    // Spins until `done`, failing rather than hanging if it takes too long
+    fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + WAIT;
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::hint::spin_loop();
+        }
+    }
+
+    // Gives every worker an unscoped task that holds it until a permit is added to the returned
+    // counter, and waits until they are all held. Each permit frees one worker. A held worker
+    // gives up after a deadline, so a failing test can't leave it spinning forever.
+    fn hold_every_worker(scheduler: &mut Scheduler) -> Arc<AtomicUsize> {
+        let workers = scheduler.threads.len();
+        let permits = Arc::new(AtomicUsize::new(0));
+        let held = Arc::new(AtomicUsize::new(0));
+        for _ in 0..workers {
+            let permits = permits.clone();
+            let held = held.clone();
+            scheduler
+                .unscoped(move || {
+                    held.fetch_add(1, Ordering::Relaxed);
+                    let deadline = Instant::now() + WAIT;
+                    while permits
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |p| p.checked_sub(1))
+                        .is_err()
+                        && Instant::now() < deadline
+                    {
+                        thread::yield_now();
+                    }
+                })
+                .unwrap();
+        }
+        wait_for("every worker to pick up an unscoped task", || {
+            held.load(Ordering::Relaxed) == workers
+        });
+        permits
+    }
+
+    // Queues unscoped tasks until the scheduler refuses one, and returns how many it accepted and
+    // the error it refused with. Each accepted task counts itself in `ran` when it runs.
+    fn fill_unscoped(
+        scheduler: &mut Scheduler,
+        ran: &Arc<AtomicUsize>,
+    ) -> (usize, Option<UnscopedSlabError>) {
+        // Well past the slab's capacity, so a scheduler that never refuses fails rather than hangs
+        for accepted in 0..1000 {
+            let ran = ran.clone();
+            if let Err(e) = scheduler.unscoped(move || {
+                ran.fetch_add(1, Ordering::Relaxed);
+            }) {
+                return (accepted, Some(e));
+            }
+        }
+        (1000, None)
+    }
+
+    #[test]
+    fn unscoped_task_runs_on_a_worker_thread() {
+        let message = panic_message_including_drop(|scheduler| {
+            let (tx, rx) = mpsc::channel();
+            scheduler
+                .unscoped(move || tx.send(thread::current().id()).unwrap())
+                .unwrap();
+            let ran_on = rx.recv_timeout(WAIT).expect("unscoped task never ran");
+            assert_ne!(ran_on, thread::current().id(), "ran on the scheduler's thread");
+        });
+        assert_eq!(message, None);
+    }
+
+    #[test]
+    fn drop_runs_every_queued_unscoped_task() {
+        const TASKS: usize = 16;
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counted = ran.clone();
+        let message = panic_message_including_drop(move |scheduler| {
+            let permits = hold_every_worker(scheduler);
+            for _ in 0..TASKS {
+                let counted = counted.clone();
+                scheduler
+                    .unscoped(move || {
+                        counted.fetch_add(1, Ordering::Relaxed);
+                    })
+                    .unwrap();
+            }
+            // Free the workers only once Drop has started, so every task is still queued then
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                permits.fetch_add(usize::MAX / 2, Ordering::Relaxed);
+            });
+        });
+        assert_eq!(message, None);
+        assert_eq!(ran.load(Ordering::Relaxed), TASKS);
+    }
+
+    #[test]
+    fn drop_waits_for_a_running_unscoped_task() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let task_finished = finished.clone();
+        let message = panic_message_including_drop(move |scheduler| {
+            let started = Arc::new(AtomicBool::new(false));
+            let task_started = started.clone();
+            scheduler
+                .unscoped(move || {
+                    task_started.store(true, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(100));
+                    task_finished.store(true, Ordering::Relaxed);
+                })
+                .unwrap();
+            wait_for("the unscoped task to start", || started.load(Ordering::Relaxed));
+        });
+        assert_eq!(message, None);
+        assert!(
+            finished.load(Ordering::Relaxed),
+            "drop returned before the unscoped task finished"
+        );
+    }
+
+    #[test]
+    fn panic_in_an_unscoped_task_reaches_the_caller_on_drop() {
+        let message = panic_message_including_drop(|scheduler| {
+            scheduler.unscoped(|| panic!("boom")).unwrap();
+        });
+        assert_eq!(message.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn workers_keep_running_unscoped_tasks_after_one_panics() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_after = ran.clone();
+        let message = panic_message_including_drop(move |scheduler| {
+            // Every worker takes one of these and panics, so the last task can only run on a worker
+            // that has already panicked
+            let workers = scheduler.threads.len();
+            let barrier = Arc::new(Barrier::new(workers));
+            for _ in 0..workers {
+                let barrier = barrier.clone();
+                scheduler
+                    .unscoped(move || {
+                        barrier.wait();
+                        panic!("boom");
+                    })
+                    .unwrap();
+            }
+            scheduler
+                .unscoped(move || ran_after.store(true, Ordering::Relaxed))
+                .unwrap();
+        });
+        assert_eq!(message.as_deref(), Some("boom"));
+        assert!(
+            ran.load(Ordering::Relaxed),
+            "no worker ran a task after a panic"
+        );
+    }
+
+    #[test]
+    fn unscoped_returns_an_error_when_too_many_tasks_are_queued() {
+        let message = panic_message_including_drop(|scheduler| {
+            let permits = hold_every_worker(scheduler);
+            let (_, refused) = fill_unscoped(scheduler, &Arc::new(AtomicUsize::new(0)));
+            permits.fetch_add(usize::MAX / 2, Ordering::Relaxed);
+            assert!(
+                matches!(refused, Some(UnscopedSlabError::MaxSlotsReached)),
+                "expected MaxSlotsReached, got {refused:?}"
+            );
+        });
+        assert_eq!(message, None);
+    }
+
+    #[test]
+    fn unscoped_accepts_tasks_again_once_queued_ones_have_run() {
+        let message = panic_message_including_drop(|scheduler| {
+            let permits = hold_every_worker(scheduler);
+            let ran = Arc::new(AtomicUsize::new(0));
+            let (accepted, _) = fill_unscoped(scheduler, &ran);
+            permits.fetch_add(usize::MAX / 2, Ordering::Relaxed);
+            wait_for("every accepted task to run", || {
+                ran.load(Ordering::Relaxed) == accepted
+            });
+            assert!(scheduler.unscoped(|| {}).is_ok());
+        });
+        assert_eq!(message, None);
+    }
+
+    #[test]
+    fn scope_does_not_run_unscoped_tasks_on_the_main_thread() {
+        const PROBES: usize = 8;
+        let message = panic_message_including_drop(|scheduler| {
+            let main = thread::current().id();
+            let permits = hold_every_worker(scheduler);
+            let ran_on_main = Arc::new(AtomicUsize::new(0));
+            for _ in 0..PROBES {
+                let ran_on_main = ran_on_main.clone();
+                scheduler
+                    .unscoped(move || {
+                        if thread::current().id() == main {
+                            ran_on_main.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
+                    .unwrap();
+            }
+            let started = AtomicBool::new(false);
+            scheduler.scope(|s| {
+                s.spawn_scoped(|_| {
+                    started.store(true, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(100));
+                });
+                // Free one worker to steal the job. The main thread then waits in the scope with
+                // its own queue empty while the probes are still queued, so it could take them.
+                // This assumes a free worker steals scoped work before taking from the shared queue
+                permits.fetch_add(1, Ordering::Relaxed);
+                wait_for("a worker to steal the scoped job", || {
+                    started.load(Ordering::Relaxed)
+                });
+            });
+            permits.fetch_add(usize::MAX / 2, Ordering::Relaxed);
+            assert_eq!(ran_on_main.load(Ordering::Relaxed), 0);
+        });
+        assert_eq!(message, None);
     }
 
     #[test]
