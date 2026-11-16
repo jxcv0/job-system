@@ -1,5 +1,12 @@
 use std::{
-    any::Any, cell::RefCell, marker::PhantomData, num::NonZero, panic::{AssertUnwindSafe, catch_unwind, resume_unwind}, range::Range, sync::{Arc, Mutex, atomic::AtomicUsize}, thread::{JoinHandle, available_parallelism},
+    any::Any,
+    cell::RefCell,
+    marker::PhantomData,
+    num::NonZero,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    range::Range,
+    sync::{Arc, Mutex},
+    thread::{JoinHandle, available_parallelism},
 };
 
 use crate::{
@@ -7,7 +14,7 @@ use crate::{
     arena::ScopeArena,
     jobs::{JobKind, WorkItem},
     queue::{self, Owner, Stealer},
-    sync::{AtomicBool, AtomicU32, Ordering},
+    sync::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     unscoped_slab::{UnscopedSlab, UnscopedSlabError},
 };
 
@@ -67,7 +74,7 @@ fn worker_loop(
             continue;
         }
 
-        if try_unscoped_run(&shared.unscoped.slab, &shared_stealer) {
+        if try_unscoped_run(&shared.unscoped, &shared_stealer) {
             continue;
         }
 
@@ -80,27 +87,51 @@ fn worker_loop(
 // should yield
 fn try_scoped_run(arena: &ScopeArena, stealers: &[Stealer]) -> bool {
     if let Some(item) = next_work_item() {
-        run_work_item(item, arena);
+        run_scoped_item(item, arena);
         return true;
     } else if let Some(item) = steal_work_item(stealers) {
         // TODO: Split the work item first before starting one of the splits
-        run_work_item(item, arena);
+        run_scoped_item(item, arena);
         return true;
     }
     false
 }
 
-fn try_unscoped_run(unscoped_slab: &Mutex<UnscopedSlab>, shared_stealer: &Stealer) -> bool {
-    false
+fn try_unscoped_run(unscoped: &Unscoped, shared_stealer: &Stealer) -> bool {
+    unscoped
+        .in_flight
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            (n < MAX_UNSCOPED_IN_FLIGHT).then_some(n + 1)
+        })
+        .unwrap();
+
+    let did_work = match shared_stealer.steal() {
+        Some(item) => match item.kind() {
+            JobKind::Unscoped => {
+                let mut slab = unscoped.slab.lock().unwrap();
+                match slab.take(item.slot()) {
+                    Some(f) => {
+                        f();
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => unreachable!(),
+        },
+        None => false,
+    };
+
+    unscoped.in_flight.fetch_sub(1, Ordering::Relaxed);
+    did_work
 }
 
 // Run a work item
-fn run_work_item(item: WorkItem, arena: &ScopeArena) {
+fn run_scoped_item(item: WorkItem, arena: &ScopeArena) {
     match item.kind() {
         // SAFETY: every queued item came from alloc_job, and a popped/stolen item is never
         // queued again, so each job runs exactly once
         JobKind::Scoped => unsafe { arena.run_job(item.slot()) },
-        JobKind::Unscoped => {}
         _ => unreachable!(),
     }
 }
@@ -191,7 +222,6 @@ impl Scheduler {
         // store the main thread's worker info
         let (main_index, main_owner) = owners.next().unwrap();
         set_worker_tls(main_owner);
-
 
         let shared = Arc::new(Shared {
             // FIXME: Work out how to size this arena
@@ -627,7 +657,7 @@ mod tests {
                     held.fetch_add(1, Ordering::Relaxed);
                     let deadline = Instant::now() + WAIT;
                     while permits
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |p| p.checked_sub(1))
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |p| p.checked_sub(1))
                         .is_err()
                         && Instant::now() < deadline
                     {

@@ -3,7 +3,7 @@
 #[cfg(loom)]
 pub(crate) use loom::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering, fence},
+    atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering, fence},
 };
 
 #[cfg(loom)]
@@ -12,7 +12,7 @@ pub(crate) use loom::cell::UnsafeCell;
 #[cfg(not(loom))]
 pub(crate) use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering, fence},
+    atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering, fence},
 };
 
 /// `std::cell::UnsafeCell` behind loom's closure-based API, so callers compile under both cfgs
