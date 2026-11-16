@@ -381,7 +381,6 @@ mod tests {
     use std::{
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
-            Barrier,
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
@@ -442,6 +441,8 @@ mod tests {
     #[test]
     fn panic_in_a_job_reaches_the_caller() {
         let message = panic_message(|scheduler| {
+            // If every worker is holding a slot, free one to steal the scoped job
+            let free_a_worker = scheduler.threads.len() <= MAX_UNSCOPED_IN_FLIGHT;
             let started = AtomicBool::new(false);
             scheduler.scope(|s| {
                 s.spawn_scoped(|_| {
@@ -460,6 +461,8 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         let job_finished = finished.clone();
         let message = panic_message(move |scheduler| {
+            // If every worker is holding a slot, free one to steal the scoped job
+            let free_a_worker = scheduler.threads.len() <= MAX_UNSCOPED_IN_FLIGHT;
             let started = AtomicBool::new(false);
             scheduler.scope(|s| {
                 s.spawn_scoped(|_| {
@@ -655,14 +658,20 @@ mod tests {
         }
     }
 
-    // Gives every worker an unscoped task that holds it until a permit is added to the returned
-    // counter, and waits until they are all held. Each permit frees one worker. A held worker
-    // gives up after a deadline, so a failing test can't leave it spinning forever.
-    fn hold_every_worker(scheduler: &mut Scheduler) -> Arc<AtomicUsize> {
-        let workers = scheduler.threads.len();
+    // How many unscoped tasks can be running at once on this machine
+    fn unscoped_capacity(scheduler: &Scheduler) -> usize {
+        MAX_UNSCOPED_IN_FLIGHT.min(scheduler.threads.len())
+    }
+
+    // Fills every in-flight slot with an unscoped task that holds its worker until a permit is
+    // added to the returned counter, and waits until they are all held. While they are held no
+    // other unscoped task can start. Each permit frees one. A held task gives up after a deadline,
+    // so a failing test can't leave it spinning forever.
+    fn hold_unscoped_slots(scheduler: &mut Scheduler) -> Arc<AtomicUsize> {
+        let slots = unscoped_capacity(scheduler);
         let permits = Arc::new(AtomicUsize::new(0));
         let held = Arc::new(AtomicUsize::new(0));
-        for _ in 0..workers {
+        for _ in 0..slots {
             let permits = permits.clone();
             let held = held.clone();
             scheduler
@@ -679,8 +688,8 @@ mod tests {
                 })
                 .unwrap();
         }
-        wait_for("every worker to pick up an unscoped task", || {
-            held.load(Ordering::Relaxed) == workers
+        wait_for("every in-flight slot to be held", || {
+            held.load(Ordering::Relaxed) == slots
         });
         permits
     }
@@ -726,7 +735,7 @@ mod tests {
         let ran = Arc::new(AtomicUsize::new(0));
         let counted = ran.clone();
         let message = panic_message_including_drop(move |scheduler| {
-            let permits = hold_every_worker(scheduler);
+            let permits = hold_unscoped_slots(scheduler);
             for _ in 0..TASKS {
                 let counted = counted.clone();
                 scheduler
@@ -783,18 +792,11 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         let ran_after = ran.clone();
         let message = panic_message_including_drop(move |scheduler| {
-            // Every worker takes one of these and panics, so the last task can only run on a worker
-            // that has already panicked
-            let workers = scheduler.threads.len();
-            let barrier = Arc::new(Barrier::new(workers));
-            for _ in 0..workers {
-                let barrier = barrier.clone();
-                scheduler
-                    .unscoped(move || {
-                        barrier.wait();
-                        panic!("boom");
-                    })
-                    .unwrap();
+            // More panics than there are workers or in-flight slots. If a panic killed its worker
+            // or leaked its slot, these would run out of one or the other before the last task
+            let panics = scheduler.threads.len().max(MAX_UNSCOPED_IN_FLIGHT) + 1;
+            for _ in 0..panics {
+                scheduler.unscoped(|| panic!("boom")).unwrap();
             }
             scheduler
                 .unscoped(move || ran_after.store(true, Ordering::Relaxed))
@@ -808,9 +810,33 @@ mod tests {
     }
 
     #[test]
+    fn no_more_than_the_in_flight_limit_of_unscoped_tasks_run_at_once() {
+        const TASKS: usize = 32;
+        let most = Arc::new(AtomicUsize::new(0));
+        let most_seen = most.clone();
+        let message = panic_message_including_drop(move |scheduler| {
+            let running = Arc::new(AtomicUsize::new(0));
+            for _ in 0..TASKS {
+                let running = running.clone();
+                let most_seen = most_seen.clone();
+                scheduler
+                    .unscoped(move || {
+                        let now = running.fetch_add(1, Ordering::Relaxed) + 1;
+                        most_seen.fetch_max(now, Ordering::Relaxed);
+                        thread::sleep(Duration::from_millis(5));
+                        running.fetch_sub(1, Ordering::Relaxed);
+                    })
+                    .unwrap();
+            }
+        });
+        assert_eq!(message, None);
+        assert!(most.load(Ordering::Relaxed) <= MAX_UNSCOPED_IN_FLIGHT);
+    }
+
+    #[test]
     fn unscoped_returns_an_error_when_too_many_tasks_are_queued() {
         let message = panic_message_including_drop(|scheduler| {
-            let permits = hold_every_worker(scheduler);
+            let permits = hold_unscoped_slots(scheduler);
             let (_, refused) = fill_unscoped(scheduler, &Arc::new(AtomicUsize::new(0)));
             permits.fetch_add(usize::MAX / 2, Ordering::Relaxed);
             assert!(
@@ -824,7 +850,7 @@ mod tests {
     #[test]
     fn unscoped_accepts_tasks_again_once_queued_ones_have_run() {
         let message = panic_message_including_drop(|scheduler| {
-            let permits = hold_every_worker(scheduler);
+            let permits = hold_unscoped_slots(scheduler);
             let ran = Arc::new(AtomicUsize::new(0));
             let (accepted, _) = fill_unscoped(scheduler, &ran);
             permits.fetch_add(usize::MAX / 2, Ordering::Relaxed);
@@ -841,7 +867,7 @@ mod tests {
         const PROBES: usize = 8;
         let message = panic_message_including_drop(|scheduler| {
             let main = thread::current().id();
-            let permits = hold_every_worker(scheduler);
+            let permits = hold_unscoped_slots(scheduler);
             let ran_on_main = Arc::new(AtomicUsize::new(0));
             for _ in 0..PROBES {
                 let ran_on_main = ran_on_main.clone();
@@ -853,16 +879,21 @@ mod tests {
                     })
                     .unwrap();
             }
+            // If every worker is holding a slot, free one to steal the scoped job
+            let free_a_worker = scheduler.threads.len() <= MAX_UNSCOPED_IN_FLIGHT;
             let started = AtomicBool::new(false);
             scheduler.scope(|s| {
                 s.spawn_scoped(|_| {
                     started.store(true, Ordering::Relaxed);
                     thread::sleep(Duration::from_millis(100));
                 });
-                // Free one worker to steal the job. The main thread then waits in the scope with
-                // its own queue empty while the probes are still queued, so it could take them.
-                // This assumes a free worker steals scoped work before taking from the shared queue
-                permits.fetch_add(1, Ordering::Relaxed);
+                // A worker steals the job, and the main thread then waits in the scope with its own
+                // queue empty while the probes are still queued, so it could take them. If a held
+                // worker had to be freed, this assumes it steals scoped work before taking from the
+                // shared queue
+                if free_a_worker {
+                    permits.fetch_add(1, Ordering::Relaxed);
+                }
                 wait_for("a worker to steal the scoped job", || {
                     started.load(Ordering::Relaxed)
                 });
