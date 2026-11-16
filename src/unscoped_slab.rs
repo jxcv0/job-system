@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn allocate_fails_when_every_slot_is_live() {
-        let mut slab = UnscopedSlab::new();
+        let slab = UnscopedSlab::new();
         for _ in 0..MAX_SLOTS {
             slab.allocate(JobKind::Unscoped, || {}).unwrap();
         }
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn allocate_succeeds_at_capacity_once_a_slot_is_taken() {
-        let mut slab = UnscopedSlab::new();
+        let slab = UnscopedSlab::new();
         let items: Vec<WorkItem> = (0..MAX_SLOTS)
             .map(|_| slab.allocate(JobKind::Unscoped, || {}).unwrap())
             .collect();
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn take_on_an_empty_slot_returns_none() {
-        let mut slab = UnscopedSlab::new();
+        let slab = UnscopedSlab::new();
         let item = slab.allocate(JobKind::Unscoped, || {}).unwrap();
 
         let _ = slab.take(item.slot()).unwrap();

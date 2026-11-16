@@ -15,6 +15,7 @@ const fn lines_for<F>() -> u32 {
 }
 
 #[repr(align(128))]
+#[allow(dead_code)]
 struct Line(UnsafeCell<MaybeUninit<[u8; CACHE_LINE]>>);
 // loom's UnsafeCell carries tracking state, so only the real cell is exactly one line
 #[cfg(not(loom))]

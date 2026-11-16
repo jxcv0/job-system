@@ -23,6 +23,7 @@ pub(crate) use std::sync::{
 pub(crate) struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
 
 #[cfg(not(loom))]
+#[allow(dead_code)]
 impl<T> UnsafeCell<T> {
     pub(crate) const fn new(data: T) -> Self {
         Self(std::cell::UnsafeCell::new(data))

@@ -1,4 +1,4 @@
-use std::{cell::Cell, marker::PhantomData, ops::Deref};
+use std::{cell::Cell, marker::PhantomData};
 
 use crate::{
     jobs::WorkItem,
