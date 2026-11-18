@@ -46,8 +46,8 @@ unscoped jobs run at once, which caps how many workers loading can tie up.
   size, copies indices `top..bottom` across at the same logical positions, and publishes it
   with `Release`. `steal` loads the pointer with `Acquire` after reading `bottom`. Old buffers
   may still be read by a thief, so they go on a retired list freed when the queue drops.
-- **Reset the `ScopeArena` when a scope ends.** Its cursor only grows, so repeated scopes
-  eventually fail with `OutOfMemory`. Its size (4096 lines) is also a placeholder.
+- **Size the `ScopeArena`.** It resets when each scope ends, but its size (4096 lines) is a
+  placeholder, and a single scope that spawns past it panics with "arena out of memory".
 - **Idle workers spin.** Sleep when there is nothing to pop or steal.
 - **Generation counters on the unscoped slab**, to catch stale indices to reused slots.
 
