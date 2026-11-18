@@ -34,10 +34,10 @@ closure or in any job is carried back and re-raised on the caller once every job
   until then, so they come from a bump allocator reset at the end of the scope.
 - **Unscoped**: run until done, possibly across frames. Their allocations live as long as the
   job, so they come from a slab with generation counters to catch stale indices.
-- **IoSubmission**: start kernel IO, then let the worker move on to other jobs.
-- **IoCompletion**: finish an IO submission once the kernel is done.
 
-Unscoped jobs come first, then the others.
+There is no separate IO job kind. Asset loading and other blocking IO run as unscoped jobs.
+A blocking job holds its worker for as long as the IO takes. At most `MAX_UNSCOPED_IN_FLIGHT` (4)
+unscoped jobs run at once, which caps how many workers loading can tie up.
 
 ## TODO
 
@@ -49,8 +49,7 @@ Unscoped jobs come first, then the others.
 - **Reset the `ScopeArena` when a scope ends.** Its cursor only grows, so repeated scopes
   eventually fail with `OutOfMemory`. Its size (4096 lines) is also a placeholder.
 - **Idle workers spin.** Sleep when there is nothing to pop or steal.
-- **Unscoped and IO jobs.** The slab allocator with generation counters, and the IO job kinds.
-  `run_work_item` only handles `JobKind::Scoped` today.
+- **Generation counters on the unscoped slab**, to catch stale indices to reused slots.
 
 ## Testing
 

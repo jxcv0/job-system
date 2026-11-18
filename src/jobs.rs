@@ -2,9 +2,7 @@
 // - Scoped. Finish at user defined scope (sync point). only need allocations to last until the end
 // of that scope so can use a bump allocator that is reset at the end of the scope
 // - Unscoped. Continue until they are complete so require an allocation that lasts as long as the
-// job does
-// - IoSubmission Jobs that submit tasks to the OS.
-// - IoCompletion jobs that finalize IO Submissions after the OS is done.
+// job does. Blocking work such as asset loading runs as unscoped jobs too
 
 use bitfield_struct::bitfield;
 
@@ -15,8 +13,6 @@ use crate::arena::closure_offset;
 pub(crate) enum JobKind {
     Scoped,
     Unscoped,
-    IoSubmission,
-    IoCompletion,
 }
 impl JobKind {
     const fn into_bits(self) -> u8 {
@@ -27,8 +23,6 @@ impl JobKind {
         match value {
             0 => Self::Scoped,
             1 => Self::Unscoped,
-            2 => Self::IoSubmission,
-            3 => Self::IoCompletion,
             _ => unreachable!(),
         }
     }
