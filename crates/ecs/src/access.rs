@@ -1,6 +1,9 @@
 use std::marker::PhantomData;
 
-use crate::{World, components::{ComponentId, IdRegister}};
+use crate::{
+    World,
+    components::{ComponentId, IdRegister},
+};
 
 use bit_set::BitSet;
 
@@ -48,7 +51,7 @@ pub(crate) trait Access {
     fn declare(ids: &mut IdRegister, set: &mut AccessSet);
 
     /// Access the colums in component storage
-    fn fetch<'world>(ids: &IdRegister, world: &'world World) -> Self::Item<'world>;
+    unsafe fn fetch<'world>(ids: &IdRegister, world: &'world World) -> Self::Item<'world>;
 }
 
 pub(crate) struct Read<T>(PhantomData<T>);
@@ -61,7 +64,7 @@ impl<T> Access for Read<T> {
         todo!()
     }
 
-    fn fetch<'world>(ids: &IdRegister, world: &'world World) -> Self::Item<'world> {
+    unsafe fn fetch<'world>(ids: &IdRegister, world: &'world World) -> Self::Item<'world> {
         todo!()
     }
 }
@@ -73,10 +76,36 @@ impl<T> Access for Write<T> {
         todo!()
     }
 
-    fn fetch<'world>(ids: &IdRegister, world: &'world World) -> Self::Item<'world> {
+    unsafe fn fetch<'world>(ids: &IdRegister, world: &'world World) -> Self::Item<'world> {
         todo!()
     }
 }
+
+macro_rules! impl_access_for_tuples {
+    // Base case: nothing left, generate nothing.
+    () => {};
+
+    // Take the first name off the list, implement for the whole list,
+    // then call ourselves again on the rest.
+    ($head:ident $(, $tail:ident)*) => {
+        impl<$head: Access, $($tail: Access),*> Access for ($head, $($tail,)*) {
+            type Item<'w> = ($head::Item<'w>, $($tail::Item<'w>,)*);
+
+            fn declare(ids: &mut IdRegister, set: &mut AccessSet) {
+                $head::declare(ids, set);
+                $($tail::declare(ids, set);)*
+            }
+
+            unsafe fn fetch<'w>(ids: &IdRegister, world: &'w World) -> Self::Item<'w> {
+                unsafe { ($head::fetch(ids, world), $($tail::fetch(ids, world),)*) }
+            }
+        }
+
+        impl_access_for_tuples!($($tail),*);
+    };
+}
+
+impl_access_for_tuples!(A, B, C, D, E, F, G, H, I, J, K, L);
 
 #[cfg(test)]
 mod tests {
