@@ -44,17 +44,20 @@ impl AccessSet {
 }
 
 pub(crate) trait Access {
-    /// What the system fn closure recieves
+    /// What the system fn closure receives
     type Item<'world>;
 
-    /// Created once at buil() and kept for the lifetime of the schedule, the system gets the same
-    /// &mut T with each call
+    /// Created once at build() and kept for the lifetime of the schedule
     type State: Send + Sync + 'static;
 
-    // declare access and create state
+    // Declare access in `set` and create it's state
     fn init(ids: &mut IdRegister, set: &mut AccessSet) -> Self::State;
 
-    /// Access the colums in component storage
+    /// # Safety
+    /// Access the colums in component storage.
+    /// No other systems may hold a conflicting access to the same columns to resources while the
+    /// returned item is alive. The schedule guarantees this with an edge between every pair of
+    /// conflicting systems.
     unsafe fn fetch<'world>(state: &'world Self::State, world: &'world World)
     -> Self::Item<'world>;
 }
@@ -64,11 +67,9 @@ pub(crate) struct Write<T>(PhantomData<T>);
 
 impl Access for () {
     type Item<'world> = ();
-    type State = ComponentId;
+    type State = ();
 
-    fn init(ids: &mut IdRegister, set: &mut AccessSet) -> Self::State {
-        ids.id_or_register::<()>()
-    }
+    fn init(_ids: &mut IdRegister, _set: &mut AccessSet) -> Self::State {}
 
     unsafe fn fetch<'world>(
         _state: &'world Self::State,
@@ -85,7 +86,9 @@ where
     type State = ComponentId;
 
     fn init(ids: &mut IdRegister, set: &mut AccessSet) -> Self::State {
-        todo!()
+        let id = ids.id_or_register::<T>();
+        set.reads(id);
+        id
     }
 
     unsafe fn fetch<'world>(
@@ -101,7 +104,9 @@ impl<T: Send + Sync + 'static> Access for Write<T> {
     type State = ComponentId;
 
     fn init(ids: &mut IdRegister, set: &mut AccessSet) -> Self::State {
-        todo!()
+        let id = ids.id_or_register::<T>();
+        set.writes(id);
+        id
     }
 
     unsafe fn fetch<'world>(
@@ -121,14 +126,18 @@ macro_rules! impl_access_for_tuples {
     ($head:ident $(, $tail:ident)*) => {
         impl<$head: Access, $($tail: Access),*> Access for ($head, $($tail,)*) {
             type Item<'w> = ($head::Item<'w>, $($tail::Item<'w>,)*);
+            type State = ($head::State, $($tail::State,)*);
 
-            fn declare(ids: &mut IdRegister, set: &mut AccessSet) {
-                $head::declare(ids, set);
-                $($tail::declare(ids, set);)*
+            fn init(ids: &mut IdRegister, set: &mut AccessSet) -> Self::State {
+                ($head::init(ids, set), $($tail::init(ids, set),)*)
             }
 
-            unsafe fn fetch<'w>(ids: &IdRegister, world: &'w World) -> Self::Item<'w> {
-                unsafe { ($head::fetch(ids, world), $($tail::fetch(ids, world),)*) }
+            // Unpacks the state tuple into variables named after the type
+            // parameters, since a macro can't count to write `state.0`, `state.1`.
+            #[allow(non_snake_case)]
+            unsafe fn fetch<'w>(state: &'w Self::State, world: &'w World) -> Self::Item<'w> {
+                let ($head, $($tail,)*) = state;
+                unsafe { ($head::fetch($head, world), $($tail::fetch($tail, world),)*) }
             }
         }
 
@@ -238,7 +247,7 @@ mod tests {
 
     fn declared<A: Access>(ids: &mut IdRegister) -> AccessSet {
         let mut set = AccessSet::new();
-        A::declare(ids, &mut set);
+        A::init(ids, &mut set);
         set
     }
 
@@ -358,5 +367,76 @@ mod tests {
     #[should_panic = "twice or read and write"]
     fn declaring_two_writes_of_one_component_panics() {
         declared::<(Write<Pos>, Write<Pos>)>(&mut IdRegister::new());
+    }
+
+    #[test]
+    fn read_and_write_keep_their_component_id_as_state() {
+        let mut ids = IdRegister::new();
+        let mut set = AccessSet::new();
+        let read = Read::<Vel>::init(&mut ids, &mut set);
+        let write = Write::<Pos>::init(&mut ids, &mut set);
+        assert_eq!(Some(read), ids.id_of::<Vel>());
+        assert_eq!(Some(write), ids.id_of::<Pos>());
+    }
+
+    #[test]
+    fn tuple_state_holds_each_element_state_in_order() {
+        let mut ids = IdRegister::new();
+        let (pos, vel) = <(Write<Pos>, Read<Vel>)>::init(&mut ids, &mut AccessSet::new());
+        assert_eq!(Some(pos), ids.id_of::<Pos>());
+        assert_eq!(Some(vel), ids.id_of::<Vel>());
+        assert_ne!(pos, vel);
+    }
+
+    #[test]
+    fn nested_tuple_state_keeps_its_shape() {
+        let mut ids = IdRegister::new();
+        let (vel, (pos,)) = <(Read<Vel>, (Write<Pos>,))>::init(&mut ids, &mut AccessSet::new());
+        assert_eq!(Some(vel), ids.id_of::<Vel>());
+        assert_eq!(Some(pos), ids.id_of::<Pos>());
+    }
+
+    #[test]
+    fn unit_declares_nothing() {
+        let mut ids = IdRegister::new();
+        let set = declared::<()>(&mut ids);
+        assert!(set.reads.is_empty());
+        assert!(set.writes.is_empty());
+        assert_eq!(ids.id_of::<()>(), None);
+    }
+
+    /// Test-only access whose state is `N` and whose fetch hands that state
+    /// back, so we can see which state each tuple element is given.
+    struct Echo<const N: u32>;
+
+    impl<const N: u32> Access for Echo<N> {
+        type Item<'w> = u32;
+        type State = u32;
+
+        fn init(_ids: &mut IdRegister, _set: &mut AccessSet) -> u32 {
+            N
+        }
+
+        unsafe fn fetch<'w>(state: &'w u32, _world: &'w World) -> u32 {
+            *state
+        }
+    }
+
+    #[test]
+    fn tuple_fetch_gives_each_element_its_own_state() {
+        let world = World {};
+        let state =
+            <(Echo<1>, Echo<2>, Echo<3>)>::init(&mut IdRegister::new(), &mut AccessSet::new());
+        let items = unsafe { <(Echo<1>, Echo<2>, Echo<3>)>::fetch(&state, &world) };
+        assert_eq!(items, (1, 2, 3));
+    }
+
+    #[test]
+    fn nested_tuple_fetch_keeps_its_shape() {
+        type Nested = (Echo<1>, (Echo<2>, Echo<3>), (Echo<4>,));
+        let world = World {};
+        let state = Nested::init(&mut IdRegister::new(), &mut AccessSet::new());
+        let items = unsafe { Nested::fetch(&state, &world) };
+        assert_eq!(items, (1, (2, 3), (4,)));
     }
 }
