@@ -115,7 +115,7 @@ fn try_unscoped_run(unscoped: &Unscoped, shared_stealer: &Stealer) -> bool {
             JobKind::Unscoped => {
                 let f = unscoped
                     .slab
-                    .take(item.slot())
+                    .take(item)
                     .expect("Expected work allocated in slab, pending counter out of sync");
                 if let Err(e) = catch_unwind(AssertUnwindSafe(f)) {
                     unscoped.panic.lock().unwrap().get_or_insert(e);

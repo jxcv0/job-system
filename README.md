@@ -49,7 +49,6 @@ unscoped jobs run at once, which caps how many workers loading can tie up.
 - **Size the `ScopeArena`.** It resets when each scope ends, but its size (4096 lines) is a
   placeholder, and a single scope that spawns past it panics with "arena out of memory".
 - **Idle workers spin.** Sleep when there is nothing to pop or steal.
-- **Generation counters on the unscoped slab**, to catch stale indices to reused slots.
 
 ## Testing
 

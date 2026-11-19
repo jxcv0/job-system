@@ -10,8 +10,16 @@ pub enum UnscopedSlabError {
 }
 
 #[derive(Default)]
+struct Slot {
+    job: Option<Box<dyn FnOnce() + Send>>,
+    /// Bumped each time the job is taken, so items for earlier jobs in this slot no longer match.
+    /// Wraps, so compare only for equality
+    generation: u16,
+}
+
+#[derive(Default)]
 struct Inner {
-    slots: Vec<Option<Box<dyn FnOnce() + Send>>>,
+    slots: Vec<Slot>,
     free: Vec<u32>,
 }
 
@@ -32,27 +40,33 @@ impl UnscopedSlab {
     {
         let mut slab = self.inner.lock().unwrap();
         let slot = if let Some(slot) = slab.free.pop() {
-            slab.slots[slot as usize] = Some(Box::new(f));
             slot
         } else if slab.slots.len() < MAX_SLOTS {
-            let slot = slab.slots.len() as u32;
-            slab.slots.push(Some(Box::new(f)));
-            slot
+            slab.slots.push(Slot::default());
+            (slab.slots.len() - 1) as u32
         } else {
             return Err(UnscopedSlabError::MaxSlotsReached);
         };
 
-        Ok(WorkItem::new().with_slot(slot).with_kind(kind))
+        let entry = &mut slab.slots[slot as usize];
+        entry.job = Some(Box::new(f));
+        Ok(WorkItem::new()
+            .with_slot(slot)
+            .with_generation(entry.generation)
+            .with_kind(kind))
     }
 
-    // Fetch work from the slab
-    pub(crate) fn take(&self, slot: u32) -> Option<Box<dyn FnOnce() + Send>> {
+    // Fetch work from the slab. Returns None if the slot is empty or now holds a later job
+    pub(crate) fn take(&self, item: WorkItem) -> Option<Box<dyn FnOnce() + Send>> {
         let mut slab = self.inner.lock().unwrap();
-        let maybe_fun = slab.slots[slot as usize].take();
-        if maybe_fun.is_some() {
-            slab.free.push(slot);
+        let entry = slab.slots.get_mut(item.slot() as usize)?;
+        if entry.generation != item.generation() {
+            return None;
         }
-        maybe_fun
+        let job = entry.job.take()?;
+        entry.generation = entry.generation.wrapping_add(1);
+        slab.free.push(item.slot());
+        Some(job)
     }
 }
 
@@ -65,7 +79,7 @@ mod tests {
     };
 
     // Allocate a job that records `id` in `ran` when it runs
-    fn allocate_recording(slab: &mut UnscopedSlab, ran: &Arc<AtomicUsize>, id: usize) -> WorkItem {
+    fn allocate_recording(slab: &UnscopedSlab, ran: &Arc<AtomicUsize>, id: usize) -> WorkItem {
         let ran = ran.clone();
         slab.allocate(JobKind::Unscoped, move || ran.store(id, Ordering::Relaxed))
             .unwrap()
@@ -73,15 +87,15 @@ mod tests {
 
     #[test]
     fn take_returns_the_job_stored_in_a_reused_slot() {
-        let mut slab = UnscopedSlab::new();
+        let slab = UnscopedSlab::new();
         let ran = Arc::new(AtomicUsize::new(0));
 
-        let first = allocate_recording(&mut slab, &ran, 1);
-        slab.take(first.slot()).unwrap()();
-        let second = allocate_recording(&mut slab, &ran, 2);
+        let first = allocate_recording(&slab, &ran, 1);
+        slab.take(first).unwrap()();
+        let second = allocate_recording(&slab, &ran, 2);
 
         assert_eq!(second.slot(), first.slot());
-        slab.take(second.slot()).unwrap()();
+        slab.take(second).unwrap()();
         assert_eq!(ran.load(Ordering::Relaxed), 2);
     }
 
@@ -105,7 +119,7 @@ mod tests {
             .map(|_| slab.allocate(JobKind::Unscoped, || {}).unwrap())
             .collect();
 
-        let _ = slab.take(items[0].slot()).unwrap();
+        let _ = slab.take(items[0]).unwrap();
 
         assert!(slab.allocate(JobKind::Unscoped, || {}).is_ok());
     }
@@ -115,8 +129,40 @@ mod tests {
         let slab = UnscopedSlab::new();
         let item = slab.allocate(JobKind::Unscoped, || {}).unwrap();
 
-        let _ = slab.take(item.slot()).unwrap();
+        let _ = slab.take(item).unwrap();
 
-        assert!(slab.take(item.slot()).is_none());
+        assert!(slab.take(item).is_none());
+    }
+
+    #[test]
+    fn take_with_a_stale_item_returns_none_after_the_slot_is_reused() {
+        let slab = UnscopedSlab::new();
+        let ran = Arc::new(AtomicUsize::new(0));
+
+        let first = allocate_recording(&slab, &ran, 1);
+        slab.take(first).unwrap()();
+        let second = allocate_recording(&slab, &ran, 2);
+        assert_eq!(second.slot(), first.slot());
+        assert_ne!(second.generation(), first.generation());
+
+        assert!(slab.take(first).is_none());
+        slab.take(second).unwrap()();
+        assert_eq!(ran.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn generation_wraps_without_breaking_take() {
+        let slab = UnscopedSlab::new();
+        let item = slab.allocate(JobKind::Unscoped, || {}).unwrap();
+        slab.inner.lock().unwrap().slots[item.slot() as usize].generation = u16::MAX;
+        let item = item.with_generation(u16::MAX);
+
+        slab.take(item).unwrap()();
+        let next = slab.allocate(JobKind::Unscoped, || {}).unwrap();
+
+        assert_eq!(next.slot(), item.slot());
+        assert_eq!(next.generation(), 0);
+        assert!(slab.take(item).is_none());
+        assert!(slab.take(next).is_some());
     }
 }

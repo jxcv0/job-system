@@ -28,12 +28,15 @@ impl JobKind {
     }
 }
 
-// A work item is a slot in an arena plus a job kind
+// A work item is a slot in an arena or slab, the slot's generation, and a job kind. The generation
+// lets the unscoped slab tell a stale item from the job now in a reused slot; scoped items leave it
+// at 0 since the arena resets as a whole
 #[bitfield(u32)]
 pub(crate) struct WorkItem {
-    #[bits(28)]
+    #[bits(15)]
     pub(crate) slot: u32,
-    #[bits(4)]
+    pub(crate) generation: u16,
+    #[bits(1)]
     pub(crate) kind: JobKind,
 }
 
