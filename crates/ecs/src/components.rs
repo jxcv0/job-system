@@ -3,12 +3,14 @@ use std::{any::TypeId, collections::HashMap};
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) struct ComponentId(u32);
 
-#[cfg(test)]
 impl ComponentId {
-    /// Lets tests in other modules pick ids directly, e.g. a high id without
-    /// registering hundreds of types first.
+    #[cfg(test)]
     pub(crate) fn from_raw(raw: u32) -> Self {
         Self(raw)
+    }
+
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
     }
 }
 

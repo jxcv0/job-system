@@ -14,15 +14,27 @@ impl AccessSet {
     }
 
     pub(crate) fn reads(&mut self, id: ComponentId) {
-        todo!()
+        let idx = id.index();
+        assert!(
+            !self.writes.contains(idx),
+            "a system can't read {id:?}, it already writes it"
+        );
+        self.reads.insert(idx);
     }
 
     pub(crate) fn writes(&mut self, id: ComponentId) {
-        todo!()
+        let idx = id.index();
+        assert!(
+            !self.reads.contains(idx) && !self.writes.contains(idx),
+            "a system can't write {id:?} twice or read and write it"
+        );
+        self.writes.insert(idx);
     }
 
     pub(crate) fn conflicts(&self, other: &AccessSet) -> bool {
-        todo!()
+        !self.writes.is_disjoint(&other.reads)
+            || !other.writes.is_disjoint(&self.reads)
+            || !self.writes.is_disjoint(&other.writes)
     }
 }
 
@@ -100,20 +112,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic = "twice or read and write"]
     fn writing_a_component_that_is_read_panics() {
         access(&[0], &[0]);
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic = "already writes"]
     fn reading_a_component_that_is_written_panics() {
         let mut set = access(&[], &[0]);
         set.reads(id(0));
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic = "twice or read and write"]
     fn writing_the_same_component_twice_panics() {
         access(&[], &[0, 0]);
     }

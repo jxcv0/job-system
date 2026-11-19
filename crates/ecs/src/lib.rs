@@ -23,7 +23,6 @@ struct Schedule {
     systems: Vec<System>,
 }
 
-///
 // Run a system at index i
 // fn run_system<'s>(graph: &'s Schedule, i: u32, s: &'s Scope<'s, '_>, world: &'s World) {
 //     let sys = &graph.systems[i as usize];
