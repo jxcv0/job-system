@@ -20,14 +20,13 @@ impl AccessSet {
     pub(crate) fn writes(&mut self, id: ComponentId) {
         todo!()
     }
+
+    pub(crate) fn conflicts(&self, other: &AccessSet) {
+        todo!()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn it_works() {
-        AccessSet::new().reads();
-    }
 }

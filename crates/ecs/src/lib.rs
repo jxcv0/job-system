@@ -1,7 +1,7 @@
 use job_system::Scope;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-// mod access;
+mod access;
 mod components;
 
 struct World {}
