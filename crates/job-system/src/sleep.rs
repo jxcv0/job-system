@@ -97,7 +97,7 @@ impl Sleep {
     fn claim_and_unpark(&self, index: usize, word: &AtomicU64) -> bool {
         let mut bits = word.load(Ordering::Relaxed);
         while bits != 0 {
-            let bit = bits & bits.wrapping_neg();
+            let bit = bits.isolate_lowest_one();
             let before = word.fetch_and(!bit, Ordering::AcqRel);
             if before & bit != 0 {
                 let worker = index * 64 + bit.trailing_zeros() as usize;
