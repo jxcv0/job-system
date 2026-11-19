@@ -238,6 +238,23 @@ impl<'s, 'env> Scope<'s, 'env> {
         }
     }
 
+    /// Open a scope nested in this one, run `f` in it, and return once every job spawned in the
+    /// nested scope has finished. Meanwhile this thread runs other scoped jobs, so it keeps
+    /// working while it waits. Jobs in the nested scope can borrow from the code that opened it,
+    /// such as a system's locals, because they all finish before this returns.
+    ///
+    /// Unlike [`Scheduler::scope`], this does not free the arena when it ends: jobs of the scopes
+    /// around it may still be using it. Everything is freed when the outermost scope ends.
+    pub fn scope<'env2, F>(&self, f: F)
+    where
+        F: for<'s2> FnOnce(&'s2 Scope<'s2, 'env2>),
+    {
+        let scope = Scope::new(self.arena, self.sleep);
+        let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
+        scope.wait();
+        scope.resume_panic(result);
+    }
+
     /// Run scoped jobs on this thread, its own or stolen, until every job spawned in this scope
     /// has finished. The jobs it runs can belong to any scope, which keeps the thread busy
     fn wait(&self) {
@@ -663,6 +680,152 @@ mod tests {
             spin_until(|| started.load(Ordering::Relaxed) == workers);
         });
         assert_eq!(ran_on_main.load(Ordering::Relaxed), workers);
+    }
+
+    #[test]
+    fn nested_scope_waits_for_its_jobs() {
+        let mut scheduler = Scheduler::new();
+        let checked = AtomicBool::new(false);
+        scheduler.scope(|s| {
+            s.spawn_scoped(|s| {
+                let ran = AtomicUsize::new(0);
+                s.scope(|inner| {
+                    for _ in 0..8 {
+                        inner.spawn_scoped(|_| {
+                            ran.fetch_add(1, Ordering::Relaxed);
+                        });
+                    }
+                });
+                assert_eq!(ran.load(Ordering::Relaxed), 8);
+                checked.store(true, Ordering::Relaxed);
+            });
+        });
+        assert!(checked.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn nested_scope_opened_on_a_worker_finishes() {
+        let message = panic_message(|scheduler| {
+            let done = AtomicBool::new(false);
+            scheduler.scope(|s| {
+                s.spawn_scoped(|s| {
+                    s.scope(|inner| {
+                        for _ in 0..4 {
+                            inner.spawn_scoped(|_| {});
+                        }
+                    });
+                    done.store(true, Ordering::Relaxed);
+                });
+                // Keep the main thread out of the queue, so a worker opens and waits on the
+                // nested scope
+                wait_for("a worker to finish its nested scope", || {
+                    done.load(Ordering::Relaxed)
+                });
+            });
+        });
+        assert_eq!(message, None);
+    }
+
+    // Each level opens a scope with two jobs, each of which recurses
+    fn nest<'s, 'env>(s: &'s Scope<'s, 'env>, depth: u32, leaves: &'env AtomicUsize) {
+        if depth == 0 {
+            leaves.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        s.scope(|inner| {
+            for _ in 0..2 {
+                inner.spawn_scoped(move |inner| nest(inner, depth - 1, leaves));
+            }
+        });
+    }
+
+    #[test]
+    fn deeply_nested_scopes_run_every_job() {
+        let mut scheduler = Scheduler::new();
+        let leaves = AtomicUsize::new(0);
+        scheduler.scope(|s| nest(s, 8, &leaves));
+        assert_eq!(leaves.load(Ordering::Relaxed), 1 << 8);
+    }
+
+    #[test]
+    fn nested_scope_does_not_free_jobs_of_the_scope_around_it() {
+        const JOBS: usize = 64;
+        let mut scheduler = Scheduler::new();
+        let sum = AtomicUsize::new(0);
+        let sum = &sum;
+        scheduler.scope(|s| {
+            // Queued before and after the nested scope; if it reset the arena, the later
+            // allocations would land on top of these closures
+            for i in 0..JOBS {
+                s.spawn_scoped(move |_| {
+                    sum.fetch_add(i, Ordering::Relaxed);
+                });
+            }
+            s.scope(|inner| {
+                for _ in 0..JOBS {
+                    inner.spawn_scoped(|_| {});
+                }
+            });
+            for i in JOBS..2 * JOBS {
+                s.spawn_scoped(move |_| {
+                    sum.fetch_add(i, Ordering::Relaxed);
+                });
+            }
+        });
+        assert_eq!(sum.load(Ordering::Relaxed), (0..2 * JOBS).sum());
+    }
+
+    #[test]
+    fn nested_scope_keeps_its_allocations_until_the_outermost_scope_ends() {
+        let mut scheduler = Scheduler::new();
+        let shared = scheduler.shared.clone();
+        let arena = &shared.arena;
+        scheduler.scope(|s| {
+            let before = arena.used_lines();
+            s.scope(|inner| {
+                for _ in 0..4 {
+                    inner.spawn_scoped(|_| {});
+                }
+            });
+            assert!(
+                arena.used_lines() >= before + 4,
+                "the nested scope freed its jobs' lines"
+            );
+        });
+        assert_eq!(arena.used_lines(), 0, "the outermost scope didn't reset");
+    }
+
+    #[test]
+    fn panic_in_a_nested_job_reaches_the_caller() {
+        let message = panic_message(|scheduler| {
+            scheduler.scope(|s| {
+                s.spawn_scoped(|s| {
+                    s.scope(|inner| inner.spawn_scoped(|_| panic!("nested boom")));
+                });
+            });
+        });
+        assert_eq!(message.as_deref(), Some("nested boom"));
+    }
+
+    #[test]
+    fn nested_jobs_can_borrow_locals_of_the_job_that_opened_the_scope() {
+        let mut scheduler = Scheduler::new();
+        let total = AtomicUsize::new(0);
+        scheduler.scope(|s| {
+            s.spawn_scoped(|s| {
+                let values = vec![1, 2, 3, 4];
+                s.scope(|inner| {
+                    for v in &values {
+                        let total = &total;
+                        inner.spawn_scoped(move |_| {
+                            total.fetch_add(*v, Ordering::Relaxed);
+                        });
+                    }
+                });
+                // `values` is dropped here, after every nested job has finished with it
+            });
+        });
+        assert_eq!(total.into_inner(), 10);
     }
 
     #[test]

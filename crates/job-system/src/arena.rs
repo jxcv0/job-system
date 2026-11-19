@@ -90,6 +90,12 @@ impl ScopeArena {
         });
     }
 
+    /// How many lines are allocated, so tests can check a scope didn't free any
+    #[cfg(test)]
+    pub(crate) fn used_lines(&self) -> u32 {
+        self.cursor.load(Ordering::Relaxed)
+    }
+
     // Reset the arena
     // SAFETY: This has a chance of "freeing" memory currently in use by jobs and must only be
     // called once it is garanteed that no worker is using any memory from the arena when it is reset.
