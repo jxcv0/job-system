@@ -32,6 +32,15 @@ the check costs a `SeqCst` fence and one load, roughly 25 ns per spawn. The fenc
 in the parking path, so a push and a worker going to sleep can't miss each other. The thread that
 owns the `Scheduler` never parks, but it does spin while it waits for a scope to finish.
 
+**Scopes nest.** `Scope::scope` opens a scope from inside a job and `Scope::par_for` runs a
+parallel loop in one, so an ECS system running as a job can split its own loop across the
+workers and know every index is done before it returns. While a nested scope waits, its thread
+runs other scoped jobs, from any scope, so no worker sits idle. Only the outermost scope,
+`Scheduler::scope`, resets the arena. A job that opens a nested scope doesn't finish until that
+scope has, so once the outermost scope has nothing pending, no job at any depth still uses the
+arena. `Scheduler::scope` takes `&mut Scheduler`, so it can't itself be nested.
+`Scheduler::par_for` is `Scope::par_for` in a fresh outermost scope.
+
 **`par_for` splits adaptively.** It halves the range into jobs, spawning the left half and
 carrying on with the right, until the split budget runs out or a piece is no longer than the
 grain. The budget starts at the thread count and halves with each split, so between `threads`
@@ -63,8 +72,9 @@ unscoped jobs run at once, which caps how many workers loading can tie up.
   size, copies indices `top..bottom` across at the same logical positions, and publishes it
   with `Release`. `steal` loads the pointer with `Acquire` after reading `bottom`. Old buffers
   may still be read by a thief, so they go on a retired list freed when the queue drops.
-- **Size the `ScopeArena`.** It resets when each scope ends, but its size (4096 lines) is a
-  placeholder, and a single scope that spawns past it panics with "arena out of memory".
+- **Size the `ScopeArena`.** It resets when the outermost scope ends, so it has to hold every job
+  that scope spawns, nested scopes included; for an ECS frame, every system's loop chunks. Its
+  size (4096 lines) is a placeholder, and spawning past it panics with "arena out of memory".
 
 ## Testing
 
