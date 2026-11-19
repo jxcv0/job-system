@@ -1,4 +1,6 @@
-use crate::components::ComponentId;
+use std::marker::PhantomData;
+
+use crate::{World, components::{ComponentId, IdRegister}};
 
 use bit_set::BitSet;
 
@@ -35,6 +37,44 @@ impl AccessSet {
         !self.writes.is_disjoint(&other.reads)
             || !other.writes.is_disjoint(&self.reads)
             || !self.writes.is_disjoint(&other.writes)
+    }
+}
+
+pub(crate) trait Access {
+    // What the system fn closure recieves
+    type Item<'world>;
+
+    // On build() say which components we touch
+    fn declare(ids: &mut IdRegister, set: &mut AccessSet);
+
+    /// Access the colums in component storage
+    fn fetch<'world>(ids: &IdRegister, world: &'world World) -> Self::Item<'world>;
+}
+
+pub(crate) struct Read<T>(PhantomData<T>);
+pub(crate) struct Write<T>(PhantomData<T>);
+
+impl<T> Access for Read<T> {
+    type Item<'world> = T;
+
+    fn declare(ids: &mut IdRegister, set: &mut AccessSet) {
+        todo!()
+    }
+
+    fn fetch<'world>(ids: &IdRegister, world: &'world World) -> Self::Item<'world> {
+        todo!()
+    }
+}
+
+impl<T> Access for Write<T> {
+    type Item<'world> = T;
+
+    fn declare(ids: &mut IdRegister, set: &mut AccessSet) {
+        todo!()
+    }
+
+    fn fetch<'world>(ids: &IdRegister, world: &'world World) -> Self::Item<'world> {
+        todo!()
     }
 }
 

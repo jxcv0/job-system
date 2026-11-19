@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 mod access;
 mod components;
 
-struct World {}
+pub struct World {}
 
 type SystemFunction = dyn Fn(&Scope, &World) + Send + Sync + 'static;
 
