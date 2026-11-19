@@ -20,8 +20,16 @@ a `debug_assert!` in `push_to_bottom`; release builds do not check it yet.
 **`Scheduler` owns the workers.** It makes one deque per `available_parallelism()`. The thread
 that creates it is worker 0; every other deque gets its own thread. Each worker gets the other
 workers' `Stealer`s, rotated so the search starts at the next queue rather than all at the
-first. The worker loop pops its own deque, else steals, else spins. Dropping the `Scheduler`
-stops and joins the workers.
+first. The worker loop pops its own deque, else steals. Dropping the `Scheduler` stops and joins
+the workers.
+
+**Idle workers park.** A worker that finds nothing for `IDLE_ROUNDS_BEFORE_PARKING` (64) rounds,
+yielding in between, sets its bit in a parked bitmask, looks for work once more, and parks.
+Every push then checks the bitmask, and if a worker is parked it claims that bit and unparks the
+worker. Claiming means each parked worker is woken once, not once per push. With nobody parked,
+the check costs a `SeqCst` fence and one load, roughly 25 ns per spawn. The fence pairs with one
+in the parking path, so a push and a worker going to sleep can't miss each other. The thread that
+owns the `Scheduler` never parks, but it does spin while it waits for a scope to finish.
 
 **`Scheduler::scope` runs scoped jobs.** `Scope::spawn` copies the closure into the
 `ScopeArena` behind a type-erased `JobHeader` and pushes its line index. While the scope has
@@ -48,7 +56,6 @@ unscoped jobs run at once, which caps how many workers loading can tie up.
   may still be read by a thief, so they go on a retired list freed when the queue drops.
 - **Size the `ScopeArena`.** It resets when each scope ends, but its size (4096 lines) is a
   placeholder, and a single scope that spawns past it panics with "arena out of memory".
-- **Idle workers spin.** Sleep when there is nothing to pop or steal.
 
 ## Testing
 

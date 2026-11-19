@@ -17,10 +17,16 @@ use crate::{
     arena::ScopeArena,
     jobs::{JobKind, WorkItem},
     queue::{self, Owner, Stealer},
+    sleep::Sleep,
     unscoped_slab::{UnscopedSlab, UnscopedSlabError},
 };
 
 const MAX_UNSCOPED_IN_FLIGHT: usize = 4;
+
+/// How many times an idle worker looks for work, yielding in between, before it parks. Long enough
+/// to ride out the short gaps between jobs in a frame, short enough that a worker with nothing to
+/// do soon stops using the CPU
+const IDLE_ROUNDS_BEFORE_PARKING: u32 = 64;
 
 thread_local! {
     /// This is the local queue that the thread owns
@@ -49,6 +55,8 @@ struct Shared {
     arena: ScopeArena,
     stop_flag: CacheAligned<AtomicBool>,
     unscoped: Unscoped,
+    /// Where idle workers park until work is pushed
+    sleep: Sleep,
 }
 
 struct Unscoped {
@@ -63,6 +71,7 @@ struct Unscoped {
 }
 
 fn worker_loop(
+    worker: usize,
     owner: Owner,
     stealers: Arc<[Stealer]>,
     shared_stealer: Stealer,
@@ -70,17 +79,31 @@ fn worker_loop(
 ) {
     // Store local worker data
     set_worker_tls(owner);
+    shared.sleep.register(worker);
 
+    let try_run = || {
+        try_scoped_run(&shared.arena, &stealers)
+            || try_unscoped_run(&shared.unscoped, &shared_stealer)
+    };
+
+    let mut idle_rounds = 0;
     while !shared.stop_flag.load(Ordering::Relaxed) {
-        if try_scoped_run(&shared.arena, &stealers) {
-            continue;
+        if try_run() {
+            idle_rounds = 0;
+        } else if idle_rounds < IDLE_ROUNDS_BEFORE_PARKING {
+            idle_rounds += 1;
+            std::thread::yield_now();
+        } else {
+            idle_rounds = 0;
+            // Announce the sleep before the last look for work, so a push that lands in between
+            // sees the sleeper and wakes it, see the `sleep` module
+            shared.sleep.prepare(worker);
+            if try_run() {
+                shared.sleep.cancel(worker);
+            } else {
+                shared.sleep.wait(worker, &shared.stop_flag);
+            }
         }
-
-        if try_unscoped_run(&shared.unscoped, &shared_stealer) {
-            continue;
-        }
-
-        std::thread::yield_now();
     }
 }
 
@@ -147,6 +170,8 @@ fn run_scoped_item(item: WorkItem, arena: &ScopeArena) {
 pub struct Scope<'s, 'env: 's> {
     /// The bump arena used for allocating jobs in the scope and its nested child scopes
     arena: &'s ScopeArena,
+    /// Woken after each spawn, in case every worker is parked
+    sleep: &'s Sleep,
     /// Counts up on spawning of new tasks and down to track the progress of the scope, work is complete when pending == 0
     pending: AtomicU32,
     /// Somewhere to store errors we get while executing jobs in the scope
@@ -158,9 +183,10 @@ pub struct Scope<'s, 'env: 's> {
     _env: PhantomData<&'env mut &'env ()>,
 }
 impl<'s, 'env> Scope<'s, 'env> {
-    fn new(arena: &'s ScopeArena) -> Self {
+    fn new(arena: &'s ScopeArena, sleep: &'s Sleep) -> Self {
         Self {
             arena,
+            sleep,
             pending: AtomicU32::new(0),
             panic: Default::default(),
             _invariant: Default::default(),
@@ -194,7 +220,8 @@ impl<'s, 'env> Scope<'s, 'env> {
                         .as_ref()
                         .expect("spawn called off a worker")
                         .push(item)
-                })
+                });
+                self.sleep.wake_one();
             }
             Err(_) => panic!("arena out of memory"),
         }
@@ -241,6 +268,8 @@ impl Scheduler {
                 pending: CacheAligned::new(AtomicUsize::new(0)),
                 panic: Mutex::new(None),
             },
+            // One per spawned worker; the main thread never parks
+            sleep: Sleep::new(np - 1),
         });
 
         // Spawn the threads
@@ -251,7 +280,8 @@ impl Scheduler {
                 let shared_stealer = shared_stealer.clone();
 
                 std::thread::spawn(move || {
-                    worker_loop(owner, stealers, shared_stealer, shared);
+                    // Owner 0 is the main thread's, so spawned workers count from 1
+                    worker_loop(index - 1, owner, stealers, shared_stealer, shared);
                 })
             })
             .collect();
@@ -272,7 +302,7 @@ impl Scheduler {
     where
         F: for<'s> FnOnce(&'s Scope<'s, 'env>),
     {
-        let scope = Scope::new(&self.shared.arena);
+        let scope = Scope::new(&self.shared.arena, &self.shared.sleep);
         let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
 
         while scope.pending.load(Ordering::Acquire) > 0 {
@@ -305,6 +335,7 @@ impl Scheduler {
         let item = unscoped.slab.allocate(JobKind::Unscoped, f)?;
         unscoped.pending.fetch_add(1, Ordering::Relaxed);
         self.shared_owner.push(item);
+        self.shared.sleep.wake_one();
         Ok(())
     }
 
@@ -361,6 +392,8 @@ impl Drop for Scheduler {
         }
 
         self.shared.stop_flag.store(true, Ordering::Relaxed);
+        // Parked workers only see the stop flag once woken
+        self.shared.sleep.wake_all();
         let mut panic = self.shared.unscoped.panic.lock().unwrap().take();
 
         for t in self.threads.drain(..) {
@@ -909,6 +942,55 @@ mod tests {
             });
             permits.fetch_add(usize::MAX / 2, Ordering::Relaxed);
             assert_eq!(ran_on_main.load(Ordering::Relaxed), 0);
+        });
+        assert_eq!(message, None);
+    }
+
+    // Waits until every worker thread has parked
+    fn wait_for_every_worker_to_park(scheduler: &Scheduler) {
+        wait_for("every worker to park", || {
+            scheduler.shared.sleep.parked() == scheduler.threads.len()
+        });
+    }
+
+    #[test]
+    fn idle_workers_park() {
+        let scheduler = Scheduler::new();
+        wait_for_every_worker_to_park(&scheduler);
+    }
+
+    #[test]
+    fn parked_workers_wake_for_scoped_work() {
+        let message = panic_message(|scheduler| {
+            wait_for_every_worker_to_park(scheduler);
+            let started = AtomicBool::new(false);
+            scheduler.scope(|s| {
+                s.spawn_scoped(|_| started.store(true, Ordering::Relaxed));
+                // Keep the main thread out of the queue, so only a woken worker can run the job
+                wait_for("a parked worker to wake and run the job", || {
+                    started.load(Ordering::Relaxed)
+                });
+            });
+        });
+        assert_eq!(message, None);
+    }
+
+    #[test]
+    fn parked_workers_wake_for_unscoped_work() {
+        let message = panic_message_including_drop(|scheduler| {
+            wait_for_every_worker_to_park(scheduler);
+            let (tx, rx) = mpsc::channel();
+            scheduler.unscoped(move || tx.send(()).unwrap()).unwrap();
+            rx.recv_timeout(WAIT)
+                .expect("no parked worker woke for the unscoped task");
+        });
+        assert_eq!(message, None);
+    }
+
+    #[test]
+    fn drop_wakes_parked_workers() {
+        let message = panic_message_including_drop(|scheduler| {
+            wait_for_every_worker_to_park(scheduler);
         });
         assert_eq!(message, None);
     }
