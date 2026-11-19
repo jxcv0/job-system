@@ -237,6 +237,26 @@ impl<'s, 'env> Scope<'s, 'env> {
             Err(_) => panic!("arena out of memory"),
         }
     }
+
+    /// Run scoped jobs on this thread, its own or stolen, until every job spawned in this scope
+    /// has finished. The jobs it runs can belong to any scope, which keeps the thread busy
+    fn wait(&self) {
+        while self.pending.load(Ordering::Acquire) > 0 {
+            if !try_scoped_run(self.arena) {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// Re-raise a panic from the scope's closure, else the first one from its jobs
+    fn resume_panic(&self, result: std::thread::Result<()>) {
+        if let Err(e) = result {
+            resume_unwind(e);
+        }
+        if let Some(e) = self.panic.lock().unwrap().take() {
+            resume_unwind(e);
+        }
+    }
 }
 
 // Exclude a workers own stealer from the set of stealers it has access to
@@ -331,23 +351,14 @@ impl Scheduler {
     {
         let scope = Scope::new(&self.shared.arena, &self.shared.sleep);
         let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
+        scope.wait();
 
-        while scope.pending.load(Ordering::Acquire) > 0 {
-            try_scoped_run(&self.shared.arena);
-            std::thread::yield_now();
-        }
-
-        // SAFETY: We know there are no more pending jobs (scope.pending == 0) so it is safe to reset the arena
+        // SAFETY: nothing in this scope is pending, and a job that opens a nested scope only
+        // finishes once that scope has, so no job at any depth is left. Scheduler::scope is never
+        // nested itself since it takes &mut Scheduler, so no other scope has jobs in the arena
         unsafe { scope.arena.reset() };
 
-        if let Err(e) = result {
-            resume_unwind(e);
-        }
-
-        let mut panic = scope.panic.lock().unwrap();
-        if let Some(e) = panic.take() {
-            resume_unwind(e);
-        }
+        scope.resume_panic(result);
     }
 
     // Set up a task that a thread will pick up and run until it's complete or returns an error
