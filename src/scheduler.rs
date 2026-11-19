@@ -267,7 +267,10 @@ impl Scheduler {
     ///
     /// If `threads` is below 2. Unscoped jobs only run on spawned workers, so at least one is needed
     pub fn with_threads(threads: usize) -> Self {
-        assert!(threads >= 2, "a Scheduler needs at least 2 threads, got {threads}");
+        assert!(
+            threads >= 2,
+            "a Scheduler needs at least 2 threads, got {threads}"
+        );
         let np = threads;
 
         let (owners, stealers): (Vec<_>, Vec<_>) = (0..np).map(|_| queue::channel()).unzip();
@@ -423,9 +426,7 @@ impl Scheduler {
         F: Fn(usize) + Sync,
     {
         let threads = self.threads.len() as u32 + 1;
-        self.scope(|s| {
-            Self::split_or_run(s, range, grain, &f, threads, threads, worker_index())
-        });
+        self.scope(|s| Self::split_or_run(s, range, grain, &f, threads, threads, worker_index()));
     }
 }
 impl Default for Scheduler {
