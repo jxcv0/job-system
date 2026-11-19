@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     marker::PhantomData,
     num::NonZero,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
@@ -31,14 +31,23 @@ const IDLE_ROUNDS_BEFORE_PARKING: u32 = 64;
 thread_local! {
     /// This is the local queue that the thread owns
     static LOCAL_OWNER: RefCell<Option<Owner>> = const { RefCell::new(None) };
+    /// Which of the scheduler's threads this is: 0 for the thread that owns the `Scheduler`, then
+    /// 1 up for the spawned workers. Lets a job tell whether it was stolen
+    static WORKER_INDEX: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Set the owner in TLS
-fn set_worker_tls(owner: Owner) {
+/// Set the owner and worker index in TLS
+fn set_worker_tls(owner: Owner, index: usize) {
     LOCAL_OWNER.with(move |l| {
         assert!(l.borrow().is_none(), "This thread already has a scheduler");
         *l.borrow_mut() = Some(owner)
     });
+    WORKER_INDEX.set(index);
+}
+
+/// The index of the scheduler thread this is running on, see [`WORKER_INDEX`]
+fn worker_index() -> usize {
+    WORKER_INDEX.get()
 }
 
 /// Get the next work item from the owner in TLS
@@ -77,8 +86,8 @@ fn worker_loop(
     shared_stealer: Stealer,
     shared: Arc<Shared>,
 ) {
-    // Store local worker data
-    set_worker_tls(owner);
+    // Store local worker data; owner 0 is the main thread's, so spawned workers count from 1
+    set_worker_tls(owner, worker + 1);
     shared.sleep.register(worker);
 
     let try_run = || {
@@ -115,7 +124,7 @@ fn try_scoped_run(arena: &ScopeArena, stealers: &[Stealer]) -> bool {
         run_scoped_item(item, arena);
         return true;
     } else if let Some(item) = steal_work_item(stealers) {
-        // TODO: Split the work item first before starting one of the splits
+        // Jobs that can split, such as par_for's, notice they were stolen and split again
         run_scoped_item(item, arena);
         return true;
     }
@@ -245,8 +254,21 @@ pub struct Scheduler {
     _not_send: PhantomData<*const ()>,
 }
 impl Scheduler {
+    /// A scheduler with one thread per CPU, counting the calling thread, and at least two
     pub fn new() -> Self {
-        let np = available_parallelism().unwrap().get();
+        Self::with_threads(available_parallelism().map_or(2, NonZero::get).max(2))
+    }
+
+    /// A scheduler with `threads` threads, counting the calling thread, so it spawns
+    /// `threads - 1` workers. Leave CPUs out to keep them free for other threads, such as a
+    /// render thread.
+    ///
+    /// # Panics
+    ///
+    /// If `threads` is below 2. Unscoped jobs only run on spawned workers, so at least one is needed
+    pub fn with_threads(threads: usize) -> Self {
+        assert!(threads >= 2, "a Scheduler needs at least 2 threads, got {threads}");
+        let np = threads;
 
         let (owners, stealers): (Vec<_>, Vec<_>) = (0..np).map(|_| queue::channel()).unzip();
         let mut owners = owners.into_iter().enumerate();
@@ -256,7 +278,7 @@ impl Scheduler {
 
         // store the main thread's worker info
         let (main_index, main_owner) = owners.next().unwrap();
-        set_worker_tls(main_owner);
+        set_worker_tls(main_owner, main_index);
 
         let shared = Arc::new(Shared {
             // FIXME: Work out how to size this arena
@@ -339,42 +361,71 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Run `f` over `range` as a job that splits itself. `splits` is the job's split budget and
+    /// `spawned_on` the worker that spawned it. A job running on another worker was stolen, which
+    /// means some thread ran out of work, so it gets a fresh budget and splits again to share its
+    /// range with the idle threads. Otherwise the budget halves with each split, so ranges no one
+    /// steals stop splitting after a few levels. This is rayon's adaptive splitting.
     fn split_range<'s, 'env, F>(
         s: &'s Scope<'s, 'env>,
         range: Range<usize>,
-        max_grain: Option<NonZero<usize>>,
+        grain: Option<NonZero<usize>>,
         f: &'s F,
-        max_depth: u32,
-        current_depth: u32,
+        splits: u32,
+        threads: u32,
+        spawned_on: usize,
+    ) where
+        F: Fn(usize) + Sync + 's,
+    {
+        let worker = worker_index();
+        let splits = if worker == spawned_on {
+            splits
+        } else {
+            splits.max(threads)
+        };
+        Self::split_or_run(s, range, grain, f, splits, threads, worker);
+    }
+
+    /// Halve `range` while the budget lasts and it is longer than `grain`, spawning the left half
+    /// and carrying on with the right, then run what is left
+    fn split_or_run<'s, 'env, F>(
+        s: &'s Scope<'s, 'env>,
+        mut range: Range<usize>,
+        grain: Option<NonZero<usize>>,
+        f: &'s F,
+        mut splits: u32,
+        threads: u32,
+        worker: usize,
     ) where
         F: Fn(usize) + Sync + 's,
     {
         assert!(range.end >= range.start);
-        let len = range.end - range.start;
-
-        if current_depth >= max_depth {
-            if let Some(max_grain) = max_grain
-                && len >= max_grain.get()
-            {
-                range.iter().for_each(&f);
+        loop {
+            let len = range.end - range.start;
+            let can_split = splits > 0 && len > 1 && grain.is_none_or(|g| len > g.get());
+            if !can_split {
+                range.iter().for_each(f);
+                return;
             }
-            let depth = current_depth + 1;
-            let halflen = len / 2;
-            let mid = range.start + halflen;
-            let (left, right) = (Range::from(range.start..mid), Range::from(mid..range.end));
-            s.spawn_scoped(move |s| Self::split_range(s, left, max_grain, f, max_depth, depth));
-            Self::split_range(s, right, max_grain, f, max_depth, depth);
-        } else {
-            range.iter().for_each(&f);
+            splits /= 2;
+            let mid = range.start + len / 2;
+            let left = Range::from(range.start..mid);
+            s.spawn_scoped(move |s| Self::split_range(s, left, grain, f, splits, threads, worker));
+            range = Range::from(mid..range.end);
         }
     }
 
-    pub fn par_for<F>(&mut self, range: Range<usize>, max_grain: Option<NonZero<usize>>, f: F)
+    /// Run `f` for every index in `range`, split across the scheduler's threads, and return once
+    /// every call has finished. Ranges at or below `grain` long are never split, so set it to the
+    /// smallest chunk worth a job. With no grain, ranges split down to single indices if needed.
+    pub fn par_for<F>(&mut self, range: Range<usize>, grain: Option<NonZero<usize>>, f: F)
     where
         F: Fn(usize) + Sync,
     {
-        let max_depth = self.threads.len().ilog2();
-        self.scope(|s| Self::split_range(s, range, max_grain, &f, max_depth, 0));
+        let threads = self.threads.len() as u32 + 1;
+        self.scope(|s| {
+            Self::split_or_run(s, range, grain, &f, threads, threads, worker_index())
+        });
     }
 }
 impl Default for Scheduler {
@@ -448,9 +499,17 @@ mod tests {
     // Runs `f` against a fresh Scheduler on its own thread and returns the message it panicked
     // with. Gives up after a deadline, so a scope that never returns fails rather than hangs.
     fn panic_message(f: impl FnOnce(&mut Scheduler) + Send + 'static) -> Option<String> {
+        panic_message_with(Scheduler::new, f)
+    }
+
+    // Like `panic_message`, with the Scheduler made by `new`
+    fn panic_message_with(
+        new: impl FnOnce() -> Scheduler + Send + 'static,
+        f: impl FnOnce(&mut Scheduler) + Send + 'static,
+    ) -> Option<String> {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let mut scheduler = Scheduler::new();
+            let mut scheduler = new();
             let payload = catch_unwind(AssertUnwindSafe(|| f(&mut scheduler))).err();
             tx.send(payload.map(payload_message)).unwrap();
         });
@@ -641,16 +700,22 @@ mod tests {
 
     // Runs par_for over `range` and returns how many times each index in 0..len was visited
     fn visits(range: std::ops::Range<usize>, grain: usize, len: usize) -> Vec<usize> {
+        visits_with(Scheduler::new, range, NonZero::new(grain), len)
+    }
+
+    // Like `visits`, with the Scheduler made by `new` and an optional grain
+    fn visits_with(
+        new: impl FnOnce() -> Scheduler + Send + 'static,
+        range: std::ops::Range<usize>,
+        grain: Option<NonZero<usize>>,
+        len: usize,
+    ) -> Vec<usize> {
         let hits: Arc<Vec<AtomicUsize>> = Arc::new((0..len).map(|_| AtomicUsize::new(0)).collect());
         let counted = hits.clone();
-        let message = panic_message(move |scheduler| {
-            scheduler.par_for(
-                Range::from(range),
-                Some(NonZero::new(grain).unwrap()),
-                |i| {
-                    counted[i].fetch_add(1, Ordering::Relaxed);
-                },
-            );
+        let message = panic_message_with(new, move |scheduler| {
+            scheduler.par_for(Range::from(range), grain, |i| {
+                counted[i].fetch_add(1, Ordering::Relaxed);
+            });
         });
         assert_eq!(message, None);
         hits.iter().map(|h| h.load(Ordering::Relaxed)).collect()
@@ -675,6 +740,98 @@ mod tests {
     #[test]
     fn par_for_over_an_empty_range_visits_nothing() {
         assert_eq!(visits(0..0, 1, 0), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn par_for_visits_every_index_exactly_once_on_small_machines() {
+        for threads in 2..=5 {
+            for grain in [None, NonZero::new(1), NonZero::new(7)] {
+                assert_eq!(
+                    visits_with(move || Scheduler::with_threads(threads), 0..100, grain, 100),
+                    vec![1; 100],
+                    "{threads} threads, grain {grain:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn par_for_with_no_grain_visits_every_index_exactly_once() {
+        let len = if cfg!(miri) { 100 } else { 1000 };
+        assert_eq!(visits_with(Scheduler::new, 0..len, None, len), vec![1; len]);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least 2 threads")]
+    fn scheduler_with_fewer_than_two_threads_panics() {
+        Scheduler::with_threads(1);
+    }
+
+    #[test]
+    fn par_for_runs_on_more_than_one_thread() {
+        let message = panic_message_with(
+            || Scheduler::with_threads(2),
+            |scheduler| {
+                // Each body waits for a second body to be running at the same time, which only
+                // happens if the range was shared with the worker
+                let running = AtomicUsize::new(0);
+                scheduler.par_for(Range::from(0..2), None, |_| {
+                    running.fetch_add(1, Ordering::Relaxed);
+                    wait_for("a second thread to run part of the range", || {
+                        running.load(Ordering::Relaxed) == 2
+                    });
+                });
+            },
+        );
+        assert_eq!(message, None);
+    }
+
+    #[test]
+    fn stolen_range_splits_again() {
+        let message = panic_message_with(
+            || Scheduler::with_threads(2),
+            |scheduler| {
+                let done: Vec<AtomicBool> = (0..16).map(|_| AtomicBool::new(false)).collect();
+                let started = AtomicBool::new(false);
+                let f = |i: usize| {
+                    started.store(true, Ordering::Relaxed);
+                    // Run as a single chunk, index 0 would wait on index 15 forever. Only a
+                    // thief that splits the range runs the last part first
+                    if i == 0 {
+                        wait_for("index 15 to run before index 0", || {
+                            done[15].load(Ordering::Relaxed)
+                        });
+                    }
+                    done[i].store(true, Ordering::Relaxed);
+                };
+                let f = &f;
+                let main = worker_index();
+                scheduler.scope(|s| {
+                    // No budget left, as if it had already split all it was allowed to
+                    s.spawn_scoped(move |s| {
+                        Scheduler::split_range(s, Range::from(0..16), None, f, 0, 2, main)
+                    });
+                    // Keep the main thread out of the queue, so the worker steals the job
+                    wait_for("the worker to steal the range", || {
+                        started.load(Ordering::Relaxed)
+                    });
+                });
+            },
+        );
+        assert_eq!(message, None);
+    }
+
+    #[test]
+    fn range_that_is_not_stolen_keeps_its_budget() {
+        let mut scheduler = Scheduler::with_threads(2);
+        let order = Mutex::new(Vec::new());
+        let f = |i: usize| order.lock().unwrap().push(i);
+        let f = &f;
+        scheduler.scope(|s| {
+            // Run on the thread that spawned it, with no budget, so it must not split
+            Scheduler::split_range(s, Range::from(0..16), None, f, 0, 2, worker_index());
+        });
+        assert_eq!(order.into_inner().unwrap(), (0..16).collect::<Vec<_>>());
     }
 
     #[test]

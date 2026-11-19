@@ -17,8 +17,9 @@ a separate job store, so pushing a job costs no allocation. The deque only moves
 **Fixed capacity.** Each deque holds `MAX_TASKS_PER_WORKER` (4096) items. Overflow is caught by
 a `debug_assert!` in `push_to_bottom`; release builds do not check it yet.
 
-**`Scheduler` owns the workers.** It makes one deque per `available_parallelism()`. The thread
-that creates it is worker 0; every other deque gets its own thread. Each worker gets the other
+**`Scheduler` owns the workers.** `Scheduler::new()` makes one deque per
+`available_parallelism()`, and at least two. `Scheduler::with_threads(n)` picks the count instead,
+for example to leave a core for a render thread. The thread that creates it is worker 0; every other deque gets its own thread. Each worker gets the other
 workers' `Stealer`s, rotated so the search starts at the next queue rather than all at the
 first. The worker loop pops its own deque, else steals. Dropping the `Scheduler` stops and joins
 the workers.
@@ -30,6 +31,14 @@ worker. Claiming means each parked worker is woken once, not once per push. With
 the check costs a `SeqCst` fence and one load, roughly 25 ns per spawn. The fence pairs with one
 in the parking path, so a push and a worker going to sleep can't miss each other. The thread that
 owns the `Scheduler` never parks, but it does spin while it waits for a scope to finish.
+
+**`par_for` splits adaptively.** It halves the range into jobs, spawning the left half and
+carrying on with the right, until the split budget runs out or a piece is no longer than the
+grain. The budget starts at the thread count and halves with each split, so between `threads`
+and `2 * threads` pieces come out when nothing is stolen. A piece that runs on a different worker
+from the one that spawned it was stolen, which means a thread ran out of work, so its budget
+resets to the thread count and it splits again for the idle threads. This is how rayon splits
+ranges.
 
 **`Scheduler::scope` runs scoped jobs.** `Scope::spawn` copies the closure into the
 `ScopeArena` behind a type-erased `JobHeader` and pushes its line index. While the scope has
