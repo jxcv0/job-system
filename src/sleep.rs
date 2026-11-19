@@ -113,10 +113,25 @@ impl Sleep {
         false
     }
 
-    /// Unpark every worker, such as when the scheduler stops. `stop` must already be set
+    /// Wake every parked worker, such as when the scheduler stops. `stop` must already be set.
+    ///
+    /// This claims every parked bit, the same handshake as [`Sleep::wake_one`], rather than
+    /// unparking each registered thread: claiming a bit makes that worker's registration visible
+    /// here, and the fence means a worker that parks after this sees `stop` in [`Sleep::wait`]
     pub(crate) fn wake_all(&self) {
-        for thread in self.threads.iter().filter_map(OnceLock::get) {
-            thread.unpark();
+        // Pairs with the fence in `prepare`: either a worker going to sleep sees `stop`, or its
+        // bit is set by the time of the swap below
+        fence(Ordering::SeqCst);
+        for (index, word) in self.parked.iter().enumerate() {
+            let mut bits = word.swap(0, Ordering::AcqRel);
+            while bits != 0 {
+                let worker = index * 64 + bits.trailing_zeros() as usize;
+                self.threads[worker]
+                    .get()
+                    .expect("a parked worker registered its thread")
+                    .unpark();
+                bits &= bits - 1;
+            }
         }
     }
 
