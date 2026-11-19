@@ -31,17 +31,21 @@ const IDLE_ROUNDS_BEFORE_PARKING: u32 = 64;
 thread_local! {
     /// This is the local queue that the thread owns
     static LOCAL_OWNER: RefCell<Option<Owner>> = const { RefCell::new(None) };
+    /// Every other worker's queue, for stealing from. Starts at the next worker and wraps round,
+    /// see [`stealers_for_worker`]
+    static LOCAL_STEALERS: RefCell<Option<Arc<[Stealer]>>> = const { RefCell::new(None) };
     /// Which of the scheduler's threads this is: 0 for the thread that owns the `Scheduler`, then
     /// 1 up for the spawned workers. Lets a job tell whether it was stolen
     static WORKER_INDEX: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Set the owner and worker index in TLS
-fn set_worker_tls(owner: Owner, index: usize) {
+/// Set the owner, stealers and worker index in TLS
+fn set_worker_tls(owner: Owner, stealers: Arc<[Stealer]>, index: usize) {
     LOCAL_OWNER.with(move |l| {
         assert!(l.borrow().is_none(), "This thread already has a scheduler");
         *l.borrow_mut() = Some(owner)
     });
+    LOCAL_STEALERS.set(Some(stealers));
     WORKER_INDEX.set(index);
 }
 
@@ -55,9 +59,9 @@ fn next_work_item() -> Option<WorkItem> {
     LOCAL_OWNER.with(|l| l.borrow().as_ref().unwrap().pop())
 }
 
-/// Steal some work from another thread
-fn steal_work_item(stealers: &[Stealer]) -> Option<WorkItem> {
-    stealers.iter().find_map(Stealer::steal)
+/// Steal some work from another worker's queue
+fn steal_work_item() -> Option<WorkItem> {
+    LOCAL_STEALERS.with_borrow(|s| s.as_ref().unwrap().iter().find_map(Stealer::steal))
 }
 
 struct Shared {
@@ -87,13 +91,11 @@ fn worker_loop(
     shared: Arc<Shared>,
 ) {
     // Store local worker data; owner 0 is the main thread's, so spawned workers count from 1
-    set_worker_tls(owner, worker + 1);
+    set_worker_tls(owner, stealers, worker + 1);
     shared.sleep.register(worker);
 
-    let try_run = || {
-        try_scoped_run(&shared.arena, &stealers)
-            || try_unscoped_run(&shared.unscoped, &shared_stealer)
-    };
+    let try_run =
+        || try_scoped_run(&shared.arena) || try_unscoped_run(&shared.unscoped, &shared_stealer);
 
     let mut idle_rounds = 0;
     while !shared.stop_flag.load(Ordering::Relaxed) {
@@ -119,11 +121,11 @@ fn worker_loop(
 // Get the next work item from TLS owner or from a [Stealer] and then run it
 // Returns true if it found a job to run otherwise false, this is used to work out if the thread
 // should yield
-fn try_scoped_run(arena: &ScopeArena, stealers: &[Stealer]) -> bool {
+fn try_scoped_run(arena: &ScopeArena) -> bool {
     if let Some(item) = next_work_item() {
         run_scoped_item(item, arena);
         return true;
-    } else if let Some(item) = steal_work_item(stealers) {
+    } else if let Some(item) = steal_work_item() {
         // Jobs that can split, such as par_for's, notice they were stolen and split again
         run_scoped_item(item, arena);
         return true;
@@ -246,7 +248,6 @@ fn stealers_for_worker(stealers: &[Stealer], index: usize) -> Arc<[Stealer]> {
 
 pub struct Scheduler {
     threads: Vec<JoinHandle<()>>,
-    stealers: Arc<[Stealer]>,
     /// shared owner for enqueing unscoped work
     shared_owner: Owner,
     shared: Arc<Shared>,
@@ -281,7 +282,11 @@ impl Scheduler {
 
         // store the main thread's worker info
         let (main_index, main_owner) = owners.next().unwrap();
-        set_worker_tls(main_owner, main_index);
+        set_worker_tls(
+            main_owner,
+            stealers_for_worker(&stealers, main_index),
+            main_index,
+        );
 
         let shared = Arc::new(Shared {
             // FIXME: Work out how to size this arena
@@ -311,11 +316,8 @@ impl Scheduler {
             })
             .collect();
 
-        let stealers = stealers_for_worker(&stealers, main_index);
-
         Self {
             threads,
-            stealers,
             shared_owner,
             shared,
             _not_send: Default::default(),
@@ -331,7 +333,7 @@ impl Scheduler {
         let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
 
         while scope.pending.load(Ordering::Acquire) > 0 {
-            try_scoped_run(&self.shared.arena, &self.stealers);
+            try_scoped_run(&self.shared.arena);
             std::thread::yield_now();
         }
 
@@ -454,6 +456,7 @@ impl Drop for Scheduler {
             }
         }
         LOCAL_OWNER.with(|l| *l.borrow_mut() = None);
+        LOCAL_STEALERS.set(None);
 
         if let Some(e) = panic
             && !std::thread::panicking()
