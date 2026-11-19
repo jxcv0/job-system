@@ -44,39 +44,70 @@ impl AccessSet {
 }
 
 pub(crate) trait Access {
-    // What the system fn closure recieves
+    /// What the system fn closure recieves
     type Item<'world>;
 
-    // On build() say which components we touch
-    fn declare(ids: &mut IdRegister, set: &mut AccessSet);
+    /// Created once at buil() and kept for the lifetime of the schedule, the system gets the same
+    /// &mut T with each call
+    type State: Send + Sync + 'static;
+
+    // declare access and create state
+    fn init(ids: &mut IdRegister, set: &mut AccessSet) -> Self::State;
 
     /// Access the colums in component storage
-    unsafe fn fetch<'world>(ids: &IdRegister, world: &'world World) -> Self::Item<'world>;
+    unsafe fn fetch<'world>(state: &'world Self::State, world: &'world World)
+    -> Self::Item<'world>;
 }
 
 pub(crate) struct Read<T>(PhantomData<T>);
 pub(crate) struct Write<T>(PhantomData<T>);
 
-impl<T> Access for Read<T> {
-    type Item<'world> = T;
+impl Access for () {
+    type Item<'world> = ();
+    type State = ComponentId;
 
-    fn declare(ids: &mut IdRegister, set: &mut AccessSet) {
+    fn init(ids: &mut IdRegister, set: &mut AccessSet) -> Self::State {
+        ids.id_or_register::<()>()
+    }
+
+    unsafe fn fetch<'world>(
+        _state: &'world Self::State,
+        _world: &'world World,
+    ) -> Self::Item<'world> {
+    }
+}
+
+impl<T> Access for Read<T>
+where
+    T: Send + Sync + 'static,
+{
+    type Item<'world> = T;
+    type State = ComponentId;
+
+    fn init(ids: &mut IdRegister, set: &mut AccessSet) -> Self::State {
         todo!()
     }
 
-    unsafe fn fetch<'world>(ids: &IdRegister, world: &'world World) -> Self::Item<'world> {
+    unsafe fn fetch<'world>(
+        state: &'world Self::State,
+        world: &'world World,
+    ) -> Self::Item<'world> {
         todo!()
     }
 }
 
-impl<T> Access for Write<T> {
+impl<T: Send + Sync + 'static> Access for Write<T> {
     type Item<'world> = T;
+    type State = ComponentId;
 
-    fn declare(ids: &mut IdRegister, set: &mut AccessSet) {
+    fn init(ids: &mut IdRegister, set: &mut AccessSet) -> Self::State {
         todo!()
     }
 
-    unsafe fn fetch<'world>(ids: &IdRegister, world: &'world World) -> Self::Item<'world> {
+    unsafe fn fetch<'world>(
+        state: &'world Self::State,
+        world: &'world World,
+    ) -> Self::Item<'world> {
         todo!()
     }
 }
@@ -197,5 +228,135 @@ mod tests {
     #[should_panic = "twice or read and write"]
     fn writing_the_same_component_twice_panics() {
         access(&[], &[0, 0]);
+    }
+
+    // Distinct component types for the declaration tests. `C<N>` gives as
+    // many as we need for the 12-element tuple.
+    struct Pos;
+    struct Vel;
+    struct C<const N: usize>;
+
+    fn declared<A: Access>(ids: &mut IdRegister) -> AccessSet {
+        let mut set = AccessSet::new();
+        A::declare(ids, &mut set);
+        set
+    }
+
+    fn reads<T: 'static>(set: &AccessSet, ids: &mut IdRegister) -> bool {
+        set.reads.contains(ids.id_or_register::<T>().index())
+    }
+
+    fn writes<T: 'static>(set: &AccessSet, ids: &mut IdRegister) -> bool {
+        set.writes.contains(ids.id_or_register::<T>().index())
+    }
+
+    #[test]
+    fn read_declares_a_read() {
+        let mut ids = IdRegister::new();
+        let set = declared::<Read<Pos>>(&mut ids);
+        assert!(reads::<Pos>(&set, &mut ids));
+        assert!(!writes::<Pos>(&set, &mut ids));
+    }
+
+    #[test]
+    fn write_declares_a_write() {
+        let mut ids = IdRegister::new();
+        let set = declared::<Write<Pos>>(&mut ids);
+        assert!(writes::<Pos>(&set, &mut ids));
+        assert!(!reads::<Pos>(&set, &mut ids));
+    }
+
+    #[test]
+    fn declaring_registers_the_component() {
+        let mut ids = IdRegister::new();
+        assert_eq!(ids.id_of::<Pos>(), None);
+        declared::<Read<Pos>>(&mut ids);
+        assert!(ids.id_of::<Pos>().is_some());
+    }
+
+    #[test]
+    fn tuple_declares_every_element() {
+        let mut ids = IdRegister::new();
+        let set = declared::<(Write<Pos>, Read<Vel>)>(&mut ids);
+        assert!(writes::<Pos>(&set, &mut ids));
+        assert!(reads::<Vel>(&set, &mut ids));
+        assert!(!reads::<Pos>(&set, &mut ids));
+        assert!(!writes::<Vel>(&set, &mut ids));
+    }
+
+    #[test]
+    fn tuple_registers_components_in_order() {
+        let mut ids = IdRegister::new();
+        declared::<(Read<Vel>, Write<Pos>)>(&mut ids);
+        assert_eq!(ids.id_of::<Vel>(), Some(id(0)));
+        assert_eq!(ids.id_of::<Pos>(), Some(id(1)));
+    }
+
+    #[test]
+    fn one_element_tuple_declares_like_its_element() {
+        let mut ids = IdRegister::new();
+        let set = declared::<(Write<Pos>,)>(&mut ids);
+        assert!(writes::<Pos>(&set, &mut ids));
+    }
+
+    #[test]
+    fn twelve_element_tuple_declares_every_element() {
+        type Twelve = (
+            Read<C<0>>,
+            Write<C<1>>,
+            Read<C<2>>,
+            Write<C<3>>,
+            Read<C<4>>,
+            Write<C<5>>,
+            Read<C<6>>,
+            Write<C<7>>,
+            Read<C<8>>,
+            Write<C<9>>,
+            Read<C<10>>,
+            Write<C<11>>,
+        );
+        let mut ids = IdRegister::new();
+        let set = declared::<Twelve>(&mut ids);
+        assert_eq!(set.reads.count(), 6);
+        assert_eq!(set.writes.count(), 6);
+        assert!(reads::<C<0>>(&set, &mut ids));
+        assert!(writes::<C<11>>(&set, &mut ids));
+    }
+
+    #[test]
+    fn nested_tuples_declare_every_element() {
+        let mut ids = IdRegister::new();
+        let set = declared::<(Read<Vel>, (Write<Pos>,))>(&mut ids);
+        assert!(reads::<Vel>(&set, &mut ids));
+        assert!(writes::<Pos>(&set, &mut ids));
+    }
+
+    #[test]
+    fn declared_systems_conflict_on_shared_components() {
+        let mut ids = IdRegister::new();
+        let movement = declared::<(Write<Pos>, Read<Vel>)>(&mut ids);
+        let render = declared::<Read<Pos>>(&mut ids);
+        let steering = declared::<Read<Vel>>(&mut ids);
+        assert_conflict(&movement, &render, true);
+        assert_conflict(&movement, &steering, false);
+        assert_conflict(&render, &steering, false);
+    }
+
+    #[test]
+    #[should_panic = "already writes"]
+    fn declaring_write_then_read_of_one_component_panics() {
+        declared::<(Write<Pos>, Read<Pos>)>(&mut IdRegister::new());
+    }
+
+    #[test]
+    #[should_panic = "twice or read and write"]
+    fn declaring_read_then_write_of_one_component_panics() {
+        declared::<(Read<Pos>, Write<Pos>)>(&mut IdRegister::new());
+    }
+
+    #[test]
+    #[should_panic = "twice or read and write"]
+    fn declaring_two_writes_of_one_component_panics() {
+        declared::<(Write<Pos>, Write<Pos>)>(&mut IdRegister::new());
     }
 }
