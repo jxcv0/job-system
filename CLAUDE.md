@@ -13,6 +13,8 @@
   trade-offs are fine. Suggest code in chat when it helps, but leave applying it to the user.
 - If a test fails because of a bug in the implementation, report the failure and what you
   think causes it rather than changing the implementation or weakening the test.
+- **Git:** you may commit and push without asking, but only on branches named `claude/...`.
+  Never commit or push to `main` or any other branch.
 
 ## Project
 
